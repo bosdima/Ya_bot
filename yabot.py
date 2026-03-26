@@ -1,7 +1,7 @@
 import os
 import logging
 import requests
-import asyncio
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -28,14 +28,28 @@ class YandexDiskDownloader:
         self.url = url
         self.file_name = None
         self.direct_link = None
+        self.file_size = None
         
     def extract_public_key(self):
         """Извлечение публичного ключа из ссылки"""
         try:
-            # Извлекаем ID файла из ссылки
+            # Поддерживаем разные форматы ссылок Яндекс.Диска
+            patterns = [
+                r'/d/([A-Za-z0-9_-]+)',  # Для disk.yandex.ru/d/...
+                r's/([A-Za-z0-9_-]+)',   # Для disk.yandex.ru/s/...
+                r'public\?key=([A-Za-z0-9_-]+)'  # Для публичных ссылок
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, self.url)
+                if match:
+                    return match.group(1)
+            
+            # Если ссылка в формате https://disk.yandex.ru/d/QWN9WPzTY9JqTw
             if '/d/' in self.url:
                 file_id = self.url.split('/d/')[1].split('?')[0]
                 return file_id
+                
             return None
         except Exception as e:
             logger.error(f"Ошибка при извлечении ключа: {e}")
@@ -46,51 +60,92 @@ class YandexDiskDownloader:
         try:
             public_key = self.extract_public_key()
             if not public_key:
+                logger.error("Не удалось извлечь публичный ключ")
                 return False
             
-            # API Яндекс.Диска для публичных ресурсов
-            api_url = f"https://cloud-api.yandex.net/v1/disk/public/resources?public_key={public_key}"
+            logger.info(f"Публичный ключ: {public_key}")
             
-            response = requests.get(api_url)
+            # API Яндекс.Диска для публичных ресурсов
+            api_url = "https://cloud-api.yandex.net/v1/disk/public/resources"
+            params = {
+                'public_key': public_key
+            }
+            
+            response = requests.get(api_url, params=params, timeout=30)
+            logger.info(f"Статус ответа API: {response.status_code}")
+            
             if response.status_code == 200:
                 data = response.json()
+                logger.info(f"Данные API: {data}")
+                
                 if 'name' in data:
                     self.file_name = data['name']
-                    self.direct_link = self.get_download_link(public_key)
-                    return True
+                    if 'size' in data:
+                        self.file_size = data['size']
+                    
+                    # Получаем ссылку для скачивания
+                    download_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
+                    download_params = {
+                        'public_key': public_key
+                    }
+                    
+                    download_response = requests.get(download_url, params=download_params, timeout=30)
+                    
+                    if download_response.status_code == 200:
+                        download_data = download_response.json()
+                        self.direct_link = download_data.get('href')
+                        logger.info(f"Получена ссылка для скачивания")
+                        return True
+                    else:
+                        logger.error(f"Ошибка получения ссылки для скачивания: {download_response.status_code}")
+                        return False
+                        
+            elif response.status_code == 404:
+                logger.error("Файл не найден на Яндекс.Диске")
+                return False
+            else:
+                logger.error(f"Ошибка API Яндекс.Диска: {response.status_code}")
+                return False
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Сетевая ошибка при получении информации о файле: {e}")
             return False
         except Exception as e:
             logger.error(f"Ошибка при получении информации о файле: {e}")
             return False
     
-    def get_download_link(self, public_key):
-        """Получение прямой ссылки для скачивания"""
-        try:
-            api_url = f"https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key={public_key}"
-            response = requests.get(api_url)
-            if response.status_code == 200:
-                data = response.json()
-                return data.get('href')
-            return None
-        except Exception as e:
-            logger.error(f"Ошибка при получении ссылки для скачивания: {e}")
-            return None
-    
     def download_file(self, save_path):
         """Скачивание файла"""
         try:
             if not self.direct_link:
+                logger.error("Нет прямой ссылки для скачивания")
                 return None
             
-            response = requests.get(self.direct_link, stream=True)
+            logger.info(f"Начинаю скачивание файла: {self.file_name}")
+            
+            # Скачиваем файл с таймаутом
+            response = requests.get(self.direct_link, stream=True, timeout=60)
+            
             if response.status_code == 200:
                 file_path = Path(save_path) / self.file_name
                 
+                # Скачиваем файл частями
                 with open(file_path, 'wb') as f:
+                    downloaded = 0
                     for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            logger.info(f"Скачано: {downloaded} байт")
                 
+                logger.info(f"Файл успешно скачан: {file_path}")
                 return file_path
+            else:
+                logger.error(f"Ошибка при скачивании: {response.status_code}")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Сетевая ошибка при скачивании файла: {e}")
             return None
         except Exception as e:
             logger.error(f"Ошибка при скачивании файла: {e}")
@@ -126,87 +181,126 @@ class TelegramBot:
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await update.message.reply_text(
-            welcome_text, 
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-    
-    async def check_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Проверка доступности файла"""
-        await update.message.reply_text("🔄 Проверяю доступность файла на Яндекс.Диске...")
-        
-        if self.downloader.get_file_info():
-            file_info = f"""
-✅ *Файл доступен!*
-
-📄 *Имя файла:* `{self.downloader.file_name}`
-📊 *Статус:* Готов к скачиванию
-
-Для скачивания используйте команду `/download` или нажмите кнопку ниже.
-            """
-            keyboard = [[InlineKeyboardButton("📥 Скачать файл", callback_data="download")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
+        try:
             await update.message.reply_text(
-                file_info, 
+                welcome_text, 
                 parse_mode='Markdown',
                 reply_markup=reply_markup
             )
-        else:
-            await update.message.reply_text(
-                "❌ *Файл не найден или недоступен!*\n"
-                "Проверьте ссылку и попробуйте снова.",
-                parse_mode='Markdown'
-            )
+        except Exception as e:
+            logger.error(f"Ошибка в start: {e}")
+            await update.message.reply_text("❌ Произошла ошибка при запуске")
+    
+    async def check_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Проверка доступности файла"""
+        message = await update.message.reply_text("🔄 Проверяю доступность файла на Яндекс.Диске...")
+        
+        try:
+            if self.downloader.get_file_info():
+                size_mb = self.downloader.file_size / (1024 * 1024) if self.downloader.file_size else 0
+                file_info = f"""
+✅ *Файл доступен!*
+
+📄 *Имя файла:* `{self.downloader.file_name}`
+📊 *Размер:* {size_mb:.2f} MB
+📁 *Статус:* Готов к скачиванию
+
+Для скачивания используйте команду `/download` или нажмите кнопку ниже.
+                """
+                keyboard = [[InlineKeyboardButton("📥 Скачать файл", callback_data="download")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await message.edit_text(
+                    file_info, 
+                    parse_mode='Markdown',
+                    reply_markup=reply_markup
+                )
+            else:
+                await message.edit_text(
+                    "❌ *Файл не найден или недоступен!*\n"
+                    "Проверьте ссылку и попробуйте снова.\n\n"
+                    f"Текущая ссылка: `{self.disk_url}`",
+                    parse_mode='Markdown'
+                )
+        except Exception as e:
+            logger.error(f"Ошибка в check_file: {e}")
+            await message.edit_text("❌ Произошла ошибка при проверке файла")
     
     async def download_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Скачивание и отправка файла"""
-        await update.message.reply_text("🔄 Проверяю доступность файла...")
+        message = await update.message.reply_text("🔄 Проверяю доступность файла...")
         
-        if not self.downloader.get_file_info():
-            await update.message.reply_text("❌ Файл не найден или недоступен!")
-            return
-        
-        await update.message.reply_text(f"📥 Начинаю скачивание файла `{self.downloader.file_name}`...", parse_mode='Markdown')
-        
-        # Создаем временную директорию для скачивания
-        temp_dir = Path("temp")
-        temp_dir.mkdir(exist_ok=True)
-        
-        # Скачиваем файл
-        file_path = self.downloader.download_file(temp_dir)
-        
-        if file_path and file_path.exists():
-            await update.message.reply_text("📤 Отправляю файл в Telegram...")
+        try:
+            if not self.downloader.get_file_info():
+                await message.edit_text("❌ Файл не найден или недоступен!")
+                return
             
-            try:
-                # Отправляем файл
-                with open(file_path, 'rb') as f:
-                    await update.message.reply_document(
-                        document=f,
-                        filename=self.downloader.file_name,
-                        caption=f"✅ Файл `{self.downloader.file_name}` успешно скачан!"
-                    )
+            await message.edit_text(f"📥 Начинаю скачивание файла `{self.downloader.file_name}`...", parse_mode='Markdown')
+            
+            # Создаем временную директорию для скачивания
+            temp_dir = Path("temp")
+            temp_dir.mkdir(exist_ok=True)
+            
+            # Скачиваем файл
+            file_path = self.downloader.download_file(temp_dir)
+            
+            if file_path and file_path.exists():
+                await message.edit_text("📤 Отправляю файл в Telegram...")
                 
-                # Удаляем временный файл
-                file_path.unlink()
+                try:
+                    # Проверяем размер файла (Telegram ограничение 50MB)
+                    file_size = file_path.stat().st_size
+                    if file_size > 50 * 1024 * 1024:  # 50 MB
+                        await message.edit_text("❌ Файл слишком большой для отправки в Telegram (максимум 50MB)")
+                        file_path.unlink()
+                        return
+                    
+                    # Отправляем файл
+                    with open(file_path, 'rb') as f:
+                        await update.message.reply_document(
+                            document=f,
+                            filename=self.downloader.file_name,
+                            caption=f"✅ Файл `{self.downloader.file_name}` успешно скачан!"
+                        )
+                    
+                    # Удаляем временный файл
+                    file_path.unlink()
+                    await message.delete()  # Удаляем сообщение о процессе
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка при отправке файла: {e}")
+                    await message.edit_text(f"❌ Ошибка при отправке файла: {str(e)}")
+                    if file_path.exists():
+                        file_path.unlink()
+            else:
+                await message.edit_text("❌ Не удалось скачать файл!")
                 
-            except Exception as e:
-                logger.error(f"Ошибка при отправке файла: {e}")
-                await update.message.reply_text(f"❌ Ошибка при отправке файла: {str(e)}")
-        else:
-            await update.message.reply_text("❌ Не удалось скачать файл!")
+        except Exception as e:
+            logger.error(f"Ошибка в download_file: {e}")
+            await message.edit_text(f"❌ Произошла ошибка: {str(e)}")
     
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик нажатий на кнопки"""
         query = update.callback_query
         await query.answer()
         
-        if query.data == "check":
-            await self.check_file(update, context)
-        elif query.data == "download":
-            await self.download_file(update, context)
+        try:
+            if query.data == "check":
+                # Создаем фейковое сообщение для check_file
+                class FakeUpdate:
+                    def __init__(self, message):
+                        self.message = message
+                
+                fake_update = FakeUpdate(query.message)
+                await self.check_file(fake_update, context)
+                
+            elif query.data == "download":
+                fake_update = FakeUpdate(query.message)
+                await self.download_file(fake_update, context)
+                
+        except Exception as e:
+            logger.error(f"Ошибка в button_handler: {e}")
+            await query.message.reply_text("❌ Произошла ошибка при обработке кнопки")
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /help"""
@@ -237,8 +331,11 @@ class TelegramBot:
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик ошибок"""
         logger.error(f"Ошибка: {context.error}")
-        if update and update.effective_message:
-            await update.effective_message.reply_text("❌ Произошла ошибка. Попробуйте позже.")
+        try:
+            if update and update.effective_message:
+                await update.effective_message.reply_text("❌ Произошла ошибка. Попробуйте позже.")
+        except:
+            pass
     
     def run(self):
         """Запуск бота"""
