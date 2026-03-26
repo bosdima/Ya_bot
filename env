@@ -1,7 +1,0 @@
-# Telegram Bot Token
-TELEGRAM_BOT_TOKEN=8737491152:AAFH3sm_59BFgcpp6XlFNWHyO9EQImhKtSI
-
-# Yandex Disk OAuth credentials
-YANDEX_CLIENT_ID=906db742a9e14d8d9e78d829b31fea46
-YANDEX_CLIENT_SECRET=2623169c64684b9791d8be0af6fe5a78
-YANDEX_REDIRECT_URI=https://oauth.yandex.ru/verification_code
