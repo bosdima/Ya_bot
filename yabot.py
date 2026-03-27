@@ -1,7 +1,6 @@
-﻿import os
+import os
 import logging
 import asyncio
-from pathlib import Path
 from typing import Dict, Optional, Tuple
 from dotenv import load_dotenv
 import yadisk
@@ -41,33 +40,34 @@ class YandexDiskClient:
         """Инициализация клиента Яндекс.Диска"""
         if self.user_id in user_tokens:
             self.y = yadisk.YaDisk(
-                id=YANDEX_CLIENT_ID,
-                secret=YANDEX_CLIENT_SECRET,
                 token=user_tokens[self.user_id]
             )
     
     def is_authenticated(self) -> bool:
         """Проверка аутентификации"""
-        return self.y is not None and self.y.check_token()
+        return self.y is not None and self.y.token is not None
     
     def get_auth_url(self) -> str:
         """Получение URL для авторизации"""
-        return yadisk.YaDisk.get_code_url(
-            client_id=YANDEX_CLIENT_ID,
-            redirect_uri=YANDEX_REDIRECT_URI
+        # Для получения URL авторизации используем отдельный экземпляр
+        auth = yadisk.YaDisk(
+            id=YANDEX_CLIENT_ID,
+            secret=YANDEX_CLIENT_SECRET
         )
+        return auth.get_code_url(redirect_uri=YANDEX_REDIRECT_URI)
     
     def set_token(self, code: str) -> bool:
         """Установка токена по коду авторизации"""
         try:
             # Получение токена по коду
-            response = yadisk.YaDisk.get_token(
-                client_id=YANDEX_CLIENT_ID,
-                client_secret=YANDEX_CLIENT_SECRET,
-                code=code,
-                redirect_uri=YANDEX_REDIRECT_URI
+            auth = yadisk.YaDisk(
+                id=YANDEX_CLIENT_ID,
+                secret=YANDEX_CLIENT_SECRET
             )
-            token = response.get('access_token')
+            
+            # В новой версии yadisk метод называется get_token
+            token = auth.get_token(code=code, redirect_uri=YANDEX_REDIRECT_URI)
+            
             if token:
                 user_tokens[self.user_id] = token
                 self._init_client()
@@ -83,16 +83,21 @@ class YandexDiskClient:
             return [], "Не авторизован"
         
         target_path = path or YANDEX_TARGET_PATH
+        
         try:
             items = []
             # Получаем содержимое папки
             for item in self.y.listdir(target_path):
-                item_type = "📁" if item.type == 'dir' else "📄"
+                # Определяем тип элемента
+                item_info = self.y.get_meta(item.path)
+                is_dir = item_info.get('type') == 'dir'
+                
+                item_type = "📁" if is_dir else "📄"
                 items.append({
                     'name': item.name,
                     'path': item.path,
-                    'type': 'dir' if item.type == 'dir' else 'file',
-                    'size': item.size if hasattr(item, 'size') else None,
+                    'type': 'dir' if is_dir else 'file',
+                    'size': item_info.get('size') if not is_dir else None,
                     'display': f"{item_type} {item.name}"
                 })
             return items, ""
@@ -124,8 +129,6 @@ class YandexDiskClient:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
-    user_id = update.effective_user.id
-    
     keyboard = [
         [InlineKeyboardButton("🔐 Авторизоваться в Яндекс.Диске", callback_data="auth")],
         [InlineKeyboardButton("📂 Показать файлы и папки", callback_data="list_files")],
@@ -164,6 +167,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data.startswith("folder_"):
         await navigate_folder(update, context)
+    
+    elif data == "back_to_menu":
+        await back_to_menu(update, context)
 
 async def auth_yandex(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Авторизация в Яндекс.Диске"""
@@ -242,8 +248,8 @@ async def list_files_after_auth(update: Update, context: ContextTypes.DEFAULT_TY
         callback_data = f"folder_{item['path']}" if item['type'] == 'dir' else f"download_{item['path']}"
         keyboard.append([InlineKeyboardButton(item['display'], callback_data=callback_data)])
     
-    # Добавляем кнопку "Наверх"
-    keyboard.append([InlineKeyboardButton("⬆️ Наверх", callback_data="list_files")])
+    # Добавляем кнопку "В главное меню"
+    keyboard.append([InlineKeyboardButton("🏠 В главное меню", callback_data="back_to_menu")])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -285,7 +291,7 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         callback_data = f"folder_{item['path']}" if item['type'] == 'dir' else f"download_{item['path']}"
         keyboard.append([InlineKeyboardButton(item['display'], callback_data=callback_data)])
     
-    # Добавляем кнопку "Назад"
+    # Добавляем кнопки навигации
     keyboard.append([InlineKeyboardButton("🏠 В главное меню", callback_data="back_to_menu")])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -428,17 +434,24 @@ def main():
         logger.error("TELEGRAM_BOT_TOKEN not found in .env file")
         return
     
+    # Проверка наличия всех необходимых переменных
+    if not all([YANDEX_CLIENT_ID, YANDEX_CLIENT_SECRET, YANDEX_TARGET_PATH]):
+        logger.error("Missing Yandex Disk configuration in .env file")
+        return
+    
     # Создаем приложение
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
     # Регистрируем обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CallbackQueryHandler(handle_callback, pattern="^(auth|list_files|help|download_|folder_|back_to_menu)$"))
+    application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_auth_code))
     
     # Запускаем бота
     print("🤖 Бот запущен...")
+    print(f"📁 Целевая папка: {YANDEX_TARGET_PATH}")
+    print(f"🔑 Yandex Client ID: {YANDEX_CLIENT_ID[:10]}...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
