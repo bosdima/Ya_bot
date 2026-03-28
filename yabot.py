@@ -1,6 +1,8 @@
 import os
+import sys
 import logging
 import asyncio
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 from dotenv import load_dotenv
 import yadisk
@@ -8,8 +10,15 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode
 
-# Загрузка переменных окружения
-load_dotenv()
+# Явно указываем путь к файлу .env
+env_path = Path('.env')
+if env_path.exists():
+    print(f"✅ Найден файл .env по пути: {env_path.absolute()}")
+    load_dotenv(env_path)
+else:
+    print(f"❌ Файл .env не найден по пути: {env_path.absolute()}")
+    # Пробуем загрузить из текущей директории
+    load_dotenv()
 
 # Настройка логирования
 logging.basicConfig(
@@ -18,14 +27,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Конфигурация
+# Конфигурация с проверкой
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 YANDEX_CLIENT_ID = os.getenv('YANDEX_CLIENT_ID')
 YANDEX_CLIENT_SECRET = os.getenv('YANDEX_CLIENT_SECRET')
 YANDEX_REDIRECT_URI = os.getenv('YANDEX_REDIRECT_URI')
 YANDEX_TARGET_PATH = os.getenv('YANDEX_TARGET_PATH')
 
-# Хранилище токенов пользователей (в реальном приложении используйте БД)
+# Диагностика загрузки переменных
+print("\n" + "="*50)
+print("📋 ДИАГНОСТИКА ЗАГРУЗКИ ПЕРЕМЕННЫХ")
+print("="*50)
+print(f"Текущая директория: {os.getcwd()}")
+print(f"Файл .env существует: {env_path.exists()}")
+print(f"TELEGRAM_BOT_TOKEN: {'✓ Загружен' if TELEGRAM_BOT_TOKEN else '✗ НЕ ЗАГРУЖЕН'}")
+print(f"YANDEX_CLIENT_ID: {'✓ Загружен' if YANDEX_CLIENT_ID else '✗ НЕ ЗАГРУЖЕН'}")
+print(f"YANDEX_CLIENT_SECRET: {'✓ Загружен' if YANDEX_CLIENT_SECRET else '✗ НЕ ЗАГРУЖЕН'}")
+print(f"YANDEX_REDIRECT_URI: {'✓ Загружен' if YANDEX_REDIRECT_URI else '✗ НЕ ЗАГРУЖЕН'}")
+print(f"YANDEX_TARGET_PATH: {'✓ Загружен' if YANDEX_TARGET_PATH else '✗ НЕ ЗАГРУЖЕН'}")
+
+if TELEGRAM_BOT_TOKEN:
+    print(f"Bot Token: {TELEGRAM_BOT_TOKEN[:15]}...")
+if YANDEX_CLIENT_ID:
+    print(f"Client ID: {YANDEX_CLIENT_ID[:10]}...")
+print("="*50 + "\n")
+
+# Хранилище токенов пользователей
 user_tokens: Dict[int, str] = {}
 
 class YandexDiskClient:
@@ -49,28 +76,38 @@ class YandexDiskClient:
     
     def get_auth_url(self) -> str:
         """Получение URL для авторизации"""
-        # Для получения URL авторизации используем отдельный экземпляр
+        if not YANDEX_CLIENT_ID or not YANDEX_CLIENT_SECRET:
+            logger.error("Yandex Disk credentials not configured")
+            return ""
+        
         auth = yadisk.YaDisk(
             id=YANDEX_CLIENT_ID,
             secret=YANDEX_CLIENT_SECRET
         )
-        return auth.get_code_url(redirect_uri=YANDEX_REDIRECT_URI)
+        return auth.get_code_url(redirect_uri=YANDEX_REDIRECT_URI or "https://oauth.yandex.ru/verification_code")
     
     def set_token(self, code: str) -> bool:
         """Установка токена по коду авторизации"""
         try:
-            # Получение токена по коду
+            if not YANDEX_CLIENT_ID or not YANDEX_CLIENT_SECRET:
+                logger.error("Yandex Disk credentials not configured")
+                return False
+            
             auth = yadisk.YaDisk(
                 id=YANDEX_CLIENT_ID,
                 secret=YANDEX_CLIENT_SECRET
             )
             
-            # В новой версии yadisk метод называется get_token
-            token = auth.get_token(code=code, redirect_uri=YANDEX_REDIRECT_URI)
+            # Получение токена по коду
+            token = auth.get_token(
+                code=code, 
+                redirect_uri=YANDEX_REDIRECT_URI or "https://oauth.yandex.ru/verification_code"
+            )
             
             if token:
                 user_tokens[self.user_id] = token
                 self._init_client()
+                logger.info(f"User {self.user_id} successfully authenticated")
                 return True
             return False
         except Exception as e:
@@ -84,20 +121,27 @@ class YandexDiskClient:
         
         target_path = path or YANDEX_TARGET_PATH
         
+        if not target_path:
+            return [], "Путь к папке не указан"
+        
         try:
             items = []
             # Получаем содержимое папки
             for item in self.y.listdir(target_path):
                 # Определяем тип элемента
-                item_info = self.y.get_meta(item.path)
-                is_dir = item_info.get('type') == 'dir'
+                try:
+                    item_info = self.y.get_meta(item.path)
+                    is_dir = item_info.get('type') == 'dir'
+                except:
+                    # Если не удалось получить метаданные, пробуем другой способ
+                    is_dir = item.path.endswith('/') or item.type == 'dir' if hasattr(item, 'type') else False
                 
                 item_type = "📁" if is_dir else "📄"
                 items.append({
                     'name': item.name,
                     'path': item.path,
                     'type': 'dir' if is_dir else 'file',
-                    'size': item_info.get('size') if not is_dir else None,
+                    'size': None,
                     'display': f"{item_type} {item.name}"
                 })
             return items, ""
@@ -129,6 +173,15 @@ class YandexDiskClient:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
+    # Проверяем конфигурацию перед стартом
+    if not YANDEX_CLIENT_ID or not YANDEX_CLIENT_SECRET:
+        await update.message.reply_text(
+            "❌ *Ошибка конфигурации*\n\n"
+            "Яндекс.Диск не настроен. Пожалуйста, проверьте файл .env",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
     keyboard = [
         [InlineKeyboardButton("🔐 Авторизоваться в Яндекс.Диске", callback_data="auth")],
         [InlineKeyboardButton("📂 Показать файлы и папки", callback_data="list_files")],
@@ -139,7 +192,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Бот для работы с Яндекс.Диском*\n\n"
         "Я помогу вам просматривать и скачивать файлы из указанной папки на Яндекс.Диске.\n\n"
-        f"📁 *Целевая папка:* `{YANDEX_TARGET_PATH}`\n\n"
+        f"📁 *Целевая папка:* `{YANDEX_TARGET_PATH or 'Не указана'}`\n\n"
         "Для начала работы необходимо авторизоваться.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=reply_markup
@@ -150,34 +203,44 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    user_id = update.effective_user.id
     data = query.data
     
     if data == "auth":
         await auth_yandex(update, context)
-    
     elif data == "list_files":
         await list_files(update, context)
-    
     elif data == "help":
         await help_command(update, context)
-    
     elif data.startswith("download_"):
         await download_file(update, context)
-    
     elif data.startswith("folder_"):
         await navigate_folder(update, context)
-    
     elif data == "back_to_menu":
         await back_to_menu(update, context)
 
 async def auth_yandex(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Авторизация в Яндекс.Диске"""
     query = update.callback_query
-    user_id = update.effective_user.id
     
+    if not YANDEX_CLIENT_ID or not YANDEX_CLIENT_SECRET:
+        await query.edit_message_text(
+            "❌ *Ошибка конфигурации*\n\n"
+            "Яндекс.Диск не настроен. Пожалуйста, проверьте файл .env",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    user_id = update.effective_user.id
     yandex_client = YandexDiskClient(user_id)
     auth_url = yandex_client.get_auth_url()
+    
+    if not auth_url:
+        await query.edit_message_text(
+            "❌ *Ошибка*\n\n"
+            "Не удалось сгенерировать ссылку для авторизации",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
     
     message = (
         "🔐 *Авторизация в Яндекс.Диске*\n\n"
@@ -242,15 +305,13 @@ async def list_files_after_auth(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("📂 Папка пуста")
         return
     
-    # Создаем клавиатуру с файлами и папками
+    # Создаем клавиатуру
     keyboard = []
     for item in items:
         callback_data = f"folder_{item['path']}" if item['type'] == 'dir' else f"download_{item['path']}"
         keyboard.append([InlineKeyboardButton(item['display'], callback_data=callback_data)])
     
-    # Добавляем кнопку "В главное меню"
     keyboard.append([InlineKeyboardButton("🏠 В главное меню", callback_data="back_to_menu")])
-    
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
@@ -285,15 +346,12 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📂 Папка пуста")
         return
     
-    # Создаем клавиатуру с файлами и папками
     keyboard = []
     for item in items:
         callback_data = f"folder_{item['path']}" if item['type'] == 'dir' else f"download_{item['path']}"
         keyboard.append([InlineKeyboardButton(item['display'], callback_data=callback_data)])
     
-    # Добавляем кнопки навигации
     keyboard.append([InlineKeyboardButton("🏠 В главное меню", callback_data="back_to_menu")])
-    
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await query.edit_message_text(
@@ -325,16 +383,13 @@ async def navigate_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📂 Папка пуста")
         return
     
-    # Создаем клавиатуру с файлами и папками
     keyboard = []
     for item in items:
         callback_data = f"folder_{item['path']}" if item['type'] == 'dir' else f"download_{item['path']}"
         keyboard.append([InlineKeyboardButton(item['display'], callback_data=callback_data)])
     
-    # Добавляем кнопки навигации
     keyboard.append([InlineKeyboardButton("⬆️ На уровень выше", callback_data="list_files")])
     keyboard.append([InlineKeyboardButton("🏠 В главное меню", callback_data="back_to_menu")])
-    
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await query.edit_message_text(
@@ -358,15 +413,11 @@ async def download_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Необходимо авторизоваться")
         return
     
-    # Получаем имя файла из пути
     file_name = file_path.split('/')[-1]
-    
-    # Скачиваем файл
     file_data = await yandex_client.download_file(file_path, file_name)
     
     if file_data:
         try:
-            # Отправляем файл
             await context.bot.send_document(
                 chat_id=update.effective_chat.id,
                 document=file_data,
@@ -432,12 +483,18 @@ def main():
     """Запуск бота"""
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN not found in .env file")
+        print("\n❌ ОШИБКА: TELEGRAM_BOT_TOKEN не найден в файле .env")
+        print("Убедитесь, что файл .env существует и содержит строку:")
+        print("TELEGRAM_BOT_TOKEN=8737491152:AAFH3sm_59BFgcpp6XlFNWHyO9EQImhKtSI")
         return
     
-    # Проверка наличия всех необходимых переменных
-    if not all([YANDEX_CLIENT_ID, YANDEX_CLIENT_SECRET, YANDEX_TARGET_PATH]):
-        logger.error("Missing Yandex Disk configuration in .env file")
-        return
+    # Проверка наличия конфигурации Яндекс.Диска (не критично для запуска, но нужно для работы)
+    if not all([YANDEX_CLIENT_ID, YANDEX_CLIENT_SECRET]):
+        logger.warning("Yandex Disk configuration is incomplete. Bot will work but Yandex Disk features won't be available.")
+        print("\n⚠️ ПРЕДУПРЕЖДЕНИЕ: Конфигурация Яндекс.Диска неполная")
+        print("Убедитесь, что в файле .env указаны:")
+        print("YANDEX_CLIENT_ID=5b91097685e2419eb0da38c4b4fc345b")
+        print("YANDEX_CLIENT_SECRET=d855d1d659484fe493df90bbd5d2ecfb")
     
     # Создаем приложение
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -449,9 +506,8 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_auth_code))
     
     # Запускаем бота
-    print("🤖 Бот запущен...")
-    print(f"📁 Целевая папка: {YANDEX_TARGET_PATH}")
-    print(f"🔑 Yandex Client ID: {YANDEX_CLIENT_ID[:10]}...")
+    print("\n🤖 Бот запущен...")
+    print("="*50)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
