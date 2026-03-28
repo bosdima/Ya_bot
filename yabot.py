@@ -2,7 +2,7 @@ import os
 import logging
 import asyncio
 from typing import Optional, Dict, Any
-from urllib.parse import urlencode, parse_qs, urlparse
+from urllib.parse import urlencode
 import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -39,6 +39,8 @@ dp = Dispatcher()
 
 # Хранилище токенов пользователей (в реальном проекте используйте БД)
 user_tokens: Dict[int, str] = {}
+# Хранилище состояний авторизации
+auth_states: Dict[int, bool] = {}
 
 class YandexDiskAPI:
     """Класс для работы с Яндекс.Диск API"""
@@ -154,11 +156,13 @@ def create_items_keyboard(items: list, path: str, is_root: bool = False) -> Inli
     keyboard = []
     
     # Кнопка "Назад" если не в корневой папке
-    if not is_root:
-        parent_path = "/".join(path.split("/")[:-1]) if path else ""
+    if not is_root and path != "/":
+        parent_path = "/".join(path.split("/")[:-1]) if path and path != "/" else "/"
+        if not parent_path:
+            parent_path = "/"
         back_button = InlineKeyboardButton(
             text="📁 Назад",
-            callback_data=f"folder:{parent_path if parent_path else '/'}"
+            callback_data=f"folder:{parent_path}"
         )
         keyboard.append([back_button])
     
@@ -209,6 +213,9 @@ async def cmd_start(message: Message):
         )
         await message.answer(welcome_text, parse_mode="Markdown")
     else:
+        # Устанавливаем флаг ожидания кода авторизации
+        auth_states[user_id] = True
+        
         welcome_text = (
             "🤖 Привет! Я бот для работы с Яндекс.Диском\n\n"
             "Я могу показать содержимое папки:\n"
@@ -217,7 +224,9 @@ async def cmd_start(message: Message):
             "1️⃣ Нажмите кнопку ниже\n"
             "2️⃣ Авторизуйтесь в Яндексе\n"
             "3️⃣ Скопируйте код из адресной строки\n"
-            "4️⃣ Отправьте код мне в чат"
+            "4️⃣ Отправьте код мне в чат\n\n"
+            "⚠️ *Важно:* Код авторизации обычно состоит из букв и цифр\n"
+            "и выглядит примерно так: `tdchvjlvdtb5zkhk`"
         )
         
         auth_button = InlineKeyboardButton(
@@ -249,6 +258,8 @@ async def cmd_logout(message: Message):
     
     if user_id in user_tokens:
         del user_tokens[user_id]
+        if user_id in auth_states:
+            del auth_states[user_id]
         await message.answer(
             "✅ Вы успешно вышли из аккаунта Яндекс.\n"
             "Используйте /start для повторной авторизации."
@@ -280,7 +291,7 @@ async def show_folder_contents(message: Message, folder_path: str, is_root: bool
         return
     
     keyboard = create_items_keyboard(items, folder_path, is_root)
-    folder_name = folder_path.split("/")[-1] if folder_path else "Корень"
+    folder_name = folder_path.split("/")[-1] if folder_path and folder_path != "/" else "Корень"
     
     await message.answer(
         f"📁 *Содержимое папки:* `{folder_name}`\n"
@@ -370,10 +381,8 @@ async def handle_auth_code(message: Message):
     text = message.text.strip()
     user_id = message.from_user.id
     
-    # Проверяем, не является ли сообщение кодом авторизации
-    # Код авторизации обычно длинный (около 30-40 символов) и состоит из букв и цифр
-    if len(text) > 20 and not text.startswith("/"):
-        
+    # Проверяем, ожидаем ли мы код авторизации от этого пользователя
+    if user_id in auth_states and auth_states[user_id]:
         # Показываем, что идет обработка
         status_msg = await message.answer("🔄 Выполняю авторизацию...")
         
@@ -382,6 +391,9 @@ async def handle_auth_code(message: Message):
         
         if token:
             user_tokens[user_id] = token
+            # Снимаем флаг ожидания авторизации
+            auth_states[user_id] = False
+            
             await status_msg.edit_text(
                 "✅ Авторизация успешна!\n\n"
                 "Теперь вы можете использовать команду /list для просмотра содержимого папки."
@@ -399,17 +411,20 @@ async def handle_auth_code(message: Message):
                 "Попробуйте снова с помощью команды /start"
             )
     else:
-        # Игнорируем другие сообщения, но даем подсказку
+        # Если пользователь не ожидает код, даем подсказку
         if user_id not in user_tokens:
             await message.answer(
                 "❓ Я не понимаю эту команду.\n\n"
-                "Если вы хотите авторизоваться:\n"
+                "Чтобы авторизоваться:\n"
                 "1. Используйте /start\n"
                 "2. Нажмите кнопку авторизации\n"
                 "3. Скопируйте код из адресной строки\n"
                 "4. Отправьте код мне\n\n"
                 "Или используйте /help для списка команд."
             )
+        else:
+            # Если пользователь уже авторизован, игнорируем
+            pass
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
