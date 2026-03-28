@@ -60,11 +60,17 @@ class YandexDiskAPI:
             "fields": "_embedded.items.name,_embedded.items.type,_embedded.items.path,_embedded.items.size,_embedded.items.modified"
         }
         
+        logger.info(f"Запрос к API: {url}, path={path}")
+        
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.get(url, headers=self.headers, params=params) as response:
+                    logger.info(f"Ответ API: статус {response.status}")
+                    
                     if response.status == 200:
-                        return await response.json()
+                        data = await response.json()
+                        logger.info(f"Получено {len(data.get('_embedded', {}).get('items', []))} элементов")
+                        return data
                     elif response.status == 401:
                         logger.error("Токен истек или недействителен")
                         return None
@@ -73,7 +79,7 @@ class YandexDiskAPI:
                         logger.error(f"Ошибка получения содержимого: {response.status} - {error_text}")
                         return None
             except Exception as e:
-                logger.error(f"Исключение при запросе: {e}")
+                logger.error(f"Исключение при запросе: {e}", exc_info=True)
                 return None
     
     async def get_download_link(self, path: str) -> Optional[str]:
@@ -127,12 +133,16 @@ async def get_access_token(auth_code: str) -> Optional[str]:
         "client_secret": CLIENT_SECRET
     }
     
+    logger.info(f"Запрос токена с кодом: {auth_code[:10]}...")
+    
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(url, data=data) as response:
                 if response.status == 200:
                     result = await response.json()
-                    return result.get("access_token")
+                    token = result.get("access_token")
+                    logger.info("Токен успешно получен")
+                    return token
                 else:
                     error_text = await response.text()
                     logger.error(f"Ошибка получения токена: {response.status} - {error_text}")
@@ -156,7 +166,7 @@ def create_items_keyboard(items: list, path: str, is_root: bool = False) -> Inli
     keyboard = []
     
     # Кнопка "Назад" если не в корневой папке
-    if not is_root and path != "/":
+    if not is_root and path != "/" and path != YANDEX_FOLDER_PATH:
         parent_path = "/".join(path.split("/")[:-1]) if path and path != "/" else "/"
         if not parent_path:
             parent_path = "/"
@@ -242,6 +252,8 @@ async def cmd_list(message: Message):
     """Обработчик команды /list - показать содержимое папки"""
     user_id = message.from_user.id
     
+    logger.info(f"Команда /list от пользователя {user_id}")
+    
     if user_id not in user_tokens:
         await message.answer(
             "⚠️ Вы не авторизованы!\n\n"
@@ -250,6 +262,53 @@ async def cmd_list(message: Message):
         return
     
     await show_folder_contents(message, YANDEX_FOLDER_PATH, is_root=True)
+
+@dp.message(Command("checkpath"))
+async def cmd_check_path(message: Message):
+    """Проверка существования пути на Яндекс.Диске"""
+    user_id = message.from_user.id
+    
+    if user_id not in user_tokens:
+        await message.answer("⚠️ Сначала авторизуйтесь с помощью /start")
+        return
+    
+    await message.answer(f"🔍 Проверяю путь: `{YANDEX_FOLDER_PATH}`", parse_mode="Markdown")
+    
+    disk_api = YandexDiskAPI(user_tokens[user_id])
+    contents = await disk_api.get_folder_contents(YANDEX_FOLDER_PATH)
+    
+    if contents:
+        items = contents.get("_embedded", {}).get("items", [])
+        await message.answer(
+            f"✅ Папка найдена!\n\n"
+            f"📁 Путь: `{YANDEX_FOLDER_PATH}`\n"
+            f"📊 Количество элементов: {len(items)}\n\n"
+            f"Используйте /list для просмотра содержимого",
+            parse_mode="Markdown"
+        )
+    else:
+        await message.answer(
+            f"❌ Папка не найдена!\n\n"
+            f"Проверенный путь: `{YANDEX_FOLDER_PATH}`\n\n"
+            f"Возможные причины:\n"
+            f"• Папка не существует\n"
+            f"• Неправильный путь (проверьте регистр и пробелы)\n"
+            f"• Нет прав доступа\n\n"
+            f"Попробуйте использовать /listroot для просмотра корневой папки",
+            parse_mode="Markdown"
+        )
+
+@dp.message(Command("listroot"))
+async def cmd_list_root(message: Message):
+    """Показать корневую папку Яндекс.Диска"""
+    user_id = message.from_user.id
+    
+    if user_id not in user_tokens:
+        await message.answer("⚠️ Сначала авторизуйтесь с помощью /start")
+        return
+    
+    await message.answer("📂 Загружаю содержимое корневой папки...")
+    await show_folder_contents(message, "/", is_root=True)
 
 @dp.message(Command("logout"))
 async def cmd_logout(message: Message):
@@ -273,22 +332,32 @@ async def show_folder_contents(message: Message, folder_path: str, is_root: bool
     token = user_tokens[user_id]
     
     disk_api = YandexDiskAPI(token)
+    
+    # Отправляем сообщение о загрузке
+    loading_msg = await message.answer(f"📂 Загружаю содержимое папки...")
+    
     contents = await disk_api.get_folder_contents(folder_path)
     
     if not contents:
-        # Проверяем, не истек ли токен
-        await message.answer(
+        await loading_msg.edit_text(
             "❌ Ошибка получения содержимого папки.\n\n"
-            "Возможно, токен авторизации истек.\n"
-            "Используйте /logout и затем /start для повторной авторизации."
+            "Возможно, папка не существует или у вас нет прав доступа.\n\n"
+            f"Проверенный путь: `{folder_path}`\n\n"
+            "Попробуйте:\n"
+            "1. Использовать /checkpath для диагностики\n"
+            "2. Использовать /listroot для просмотра корневой папки\n"
+            "3. Проверить правильность пути",
+            parse_mode="Markdown"
         )
         return
     
     items = contents.get("_embedded", {}).get("items", [])
     
     if not items:
-        await message.answer("📂 Папка пуста")
+        await loading_msg.edit_text("📂 Папка пуста")
         return
+    
+    await loading_msg.delete()
     
     keyboard = create_items_keyboard(items, folder_path, is_root)
     folder_name = folder_path.split("/")[-1] if folder_path and folder_path != "/" else "Корень"
@@ -422,9 +491,6 @@ async def handle_auth_code(message: Message):
                 "4. Отправьте код мне\n\n"
                 "Или используйте /help для списка команд."
             )
-        else:
-            # Если пользователь уже авторизован, игнорируем
-            pass
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
@@ -433,6 +499,8 @@ async def cmd_help(message: Message):
         "📚 *Доступные команды:*\n\n"
         "/start - Начать работу и авторизоваться\n"
         "/list - Показать содержимое папки\n"
+        "/checkpath - Проверить существование папки\n"
+        "/listroot - Показать корневую папку диска\n"
         "/logout - Выйти из аккаунта Яндекс\n"
         "/help - Показать эту справку\n\n"
         "*🔐 Как авторизоваться:*\n"
@@ -456,6 +524,7 @@ async def main():
     """Основная функция запуска бота"""
     logger.info("Запуск бота...")
     logger.info(f"Путь к папке на Яндекс.Диске: {YANDEX_FOLDER_PATH}")
+    logger.info(f"Bot token: {BOT_TOKEN[:10]}...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
