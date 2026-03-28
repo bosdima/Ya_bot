@@ -1,8 +1,8 @@
-﻿import os
+import os
 import logging
 import asyncio
 from typing import Optional, Dict, Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, parse_qs, urlparse
 import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -63,6 +63,9 @@ class YandexDiskAPI:
                 async with session.get(url, headers=self.headers, params=params) as response:
                     if response.status == 200:
                         return await response.json()
+                    elif response.status == 401:
+                        logger.error("Токен истек или недействителен")
+                        return None
                     else:
                         error_text = await response.text()
                         logger.error(f"Ошибка получения содержимого: {response.status} - {error_text}")
@@ -119,8 +122,7 @@ async def get_access_token(auth_code: str) -> Optional[str]:
         "grant_type": "authorization_code",
         "code": auth_code,
         "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "redirect_uri": REDIRECT_URI
+        "client_secret": CLIENT_SECRET
     }
     
     async with aiohttp.ClientSession() as session:
@@ -130,7 +132,8 @@ async def get_access_token(auth_code: str) -> Optional[str]:
                     result = await response.json()
                     return result.get("access_token")
                 else:
-                    logger.error(f"Ошибка получения токена: {response.status}")
+                    error_text = await response.text()
+                    logger.error(f"Ошибка получения токена: {response.status} - {error_text}")
                     return None
         except Exception as e:
             logger.error(f"Исключение при получении токена: {e}")
@@ -138,6 +141,8 @@ async def get_access_token(auth_code: str) -> Optional[str]:
 
 def format_size(size: int) -> str:
     """Форматирование размера файла"""
+    if not size:
+        return "0 Б"
     for unit in ['Б', 'КБ', 'МБ', 'ГБ']:
         if size < 1024.0:
             return f"{size:.1f} {unit}"
@@ -158,13 +163,13 @@ def create_items_keyboard(items: list, path: str, is_root: bool = False) -> Inli
         keyboard.append([back_button])
     
     # Сортировка: сначала папки, потом файлы
-    folders = [item for item in items if item['type'] == 'dir']
-    files = [item for item in items if item['type'] == 'file']
+    folders = [item for item in items if item.get('type') == 'dir']
+    files = [item for item in items if item.get('type') == 'file']
     
     # Добавляем папки
     for folder in folders:
-        folder_name = folder['name']
-        folder_path = folder['path']
+        folder_name = folder.get('name', 'Без названия')
+        folder_path = folder.get('path', '')
         keyboard.append([
             InlineKeyboardButton(
                 text=f"📁 {folder_name}",
@@ -174,12 +179,12 @@ def create_items_keyboard(items: list, path: str, is_root: bool = False) -> Inli
     
     # Добавляем файлы
     for file in files:
-        file_name = file['name']
+        file_name = file.get('name', 'Без названия')
         file_size = format_size(file.get('size', 0))
         keyboard.append([
             InlineKeyboardButton(
                 text=f"📄 {file_name} ({file_size})",
-                callback_data=f"file:{file['path']}"
+                callback_data=f"file:{file.get('path', '')}"
             )
         ])
     
@@ -191,20 +196,37 @@ def create_items_keyboard(items: list, path: str, is_root: bool = False) -> Inli
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     """Обработчик команды /start"""
-    welcome_text = (
-        "🤖 Привет! Я бот для работы с Яндекс.Диском\n\n"
-        "Я могу показать содержимое папки:\n"
-        f"`{YANDEX_FOLDER_PATH}`\n\n"
-        "🔐 Для начала работы необходимо авторизоваться в Яндексе."
-    )
+    user_id = message.from_user.id
     
-    auth_button = InlineKeyboardButton(
-        text="🔑 Авторизоваться в Яндекс",
-        url=get_auth_url()
-    )
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[auth_button]])
-    
-    await message.answer(welcome_text, reply_markup=keyboard, parse_mode="Markdown")
+    # Проверяем, авторизован ли пользователь
+    if user_id in user_tokens:
+        welcome_text = (
+            f"🤖 Привет! Я бот для работы с Яндекс.Диском\n\n"
+            f"✅ Вы уже авторизованы!\n\n"
+            f"📁 Текущая папка:\n"
+            f"`{YANDEX_FOLDER_PATH}`\n\n"
+            f"Используйте команду /list для просмотра содержимого."
+        )
+        await message.answer(welcome_text, parse_mode="Markdown")
+    else:
+        welcome_text = (
+            "🤖 Привет! Я бот для работы с Яндекс.Диском\n\n"
+            "Я могу показать содержимое папки:\n"
+            f"`{YANDEX_FOLDER_PATH}`\n\n"
+            "🔐 Для начала работы необходимо авторизоваться в Яндексе.\n\n"
+            "1️⃣ Нажмите кнопку ниже\n"
+            "2️⃣ Авторизуйтесь в Яндексе\n"
+            "3️⃣ Скопируйте код из адресной строки\n"
+            "4️⃣ Отправьте код мне в чат"
+        )
+        
+        auth_button = InlineKeyboardButton(
+            text="🔑 Авторизоваться в Яндекс",
+            url=get_auth_url()
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[auth_button]])
+        
+        await message.answer(welcome_text, reply_markup=keyboard, parse_mode="Markdown")
 
 @dp.message(Command("list"))
 async def cmd_list(message: Message):
@@ -213,12 +235,26 @@ async def cmd_list(message: Message):
     
     if user_id not in user_tokens:
         await message.answer(
-            "⚠️ Вы не авторизованы!\n"
+            "⚠️ Вы не авторизованы!\n\n"
             "Используйте команду /start для авторизации."
         )
         return
     
     await show_folder_contents(message, YANDEX_FOLDER_PATH, is_root=True)
+
+@dp.message(Command("logout"))
+async def cmd_logout(message: Message):
+    """Обработчик команды /logout - выход из аккаунта"""
+    user_id = message.from_user.id
+    
+    if user_id in user_tokens:
+        del user_tokens[user_id]
+        await message.answer(
+            "✅ Вы успешно вышли из аккаунта Яндекс.\n"
+            "Используйте /start для повторной авторизации."
+        )
+    else:
+        await message.answer("Вы не были авторизованы.")
 
 async def show_folder_contents(message: Message, folder_path: str, is_root: bool = False):
     """Показать содержимое папки"""
@@ -229,7 +265,12 @@ async def show_folder_contents(message: Message, folder_path: str, is_root: bool
     contents = await disk_api.get_folder_contents(folder_path)
     
     if not contents:
-        await message.answer("❌ Ошибка получения содержимого папки")
+        # Проверяем, не истек ли токен
+        await message.answer(
+            "❌ Ошибка получения содержимого папки.\n\n"
+            "Возможно, токен авторизации истек.\n"
+            "Используйте /logout и затем /start для повторной авторизации."
+        )
         return
     
     items = contents.get("_embedded", {}).get("items", [])
@@ -242,8 +283,8 @@ async def show_folder_contents(message: Message, folder_path: str, is_root: bool
     folder_name = folder_path.split("/")[-1] if folder_path else "Корень"
     
     await message.answer(
-        f"📁 Содержимое папки: *{folder_name}*\n"
-        f"Всего элементов: {len(items)}",
+        f"📁 *Содержимое папки:* `{folder_name}`\n"
+        f"📊 *Всего элементов:* {len(items)}",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
@@ -323,32 +364,52 @@ async def handle_empty_callback(callback: CallbackQuery):
     """Обработка нажатия на пустую папку"""
     await callback.answer("Папка пуста", show_alert=False)
 
-@dp.message(F.text)
+@dp.message(F.text & ~F.text.startswith("/"))
 async def handle_auth_code(message: Message):
     """Обработка кода авторизации"""
     text = message.text.strip()
+    user_id = message.from_user.id
     
     # Проверяем, не является ли сообщение кодом авторизации
+    # Код авторизации обычно длинный (около 30-40 символов) и состоит из букв и цифр
     if len(text) > 20 and not text.startswith("/"):
-        user_id = message.from_user.id
+        
+        # Показываем, что идет обработка
+        status_msg = await message.answer("🔄 Выполняю авторизацию...")
         
         # Пытаемся получить токен
         token = await get_access_token(text)
         
         if token:
             user_tokens[user_id] = token
-            await message.answer(
+            await status_msg.edit_text(
                 "✅ Авторизация успешна!\n\n"
                 "Теперь вы можете использовать команду /list для просмотра содержимого папки."
             )
+            
+            # Показываем содержимое папки сразу после авторизации
+            await show_folder_contents(message, YANDEX_FOLDER_PATH, is_root=True)
         else:
-            await message.answer(
-                "❌ Ошибка авторизации. Проверьте код и попробуйте снова.\n"
-                "Используйте команду /start для повторной авторизации."
+            await status_msg.edit_text(
+                "❌ Ошибка авторизации.\n\n"
+                "Возможные причины:\n"
+                "• Неверный код подтверждения\n"
+                "• Код уже был использован\n"
+                "• Код истек (действует 5 минут)\n\n"
+                "Попробуйте снова с помощью команды /start"
             )
     else:
-        # Игнорируем другие сообщения
-        pass
+        # Игнорируем другие сообщения, но даем подсказку
+        if user_id not in user_tokens:
+            await message.answer(
+                "❓ Я не понимаю эту команду.\n\n"
+                "Если вы хотите авторизоваться:\n"
+                "1. Используйте /start\n"
+                "2. Нажмите кнопку авторизации\n"
+                "3. Скопируйте код из адресной строки\n"
+                "4. Отправьте код мне\n\n"
+                "Или используйте /help для списка команд."
+            )
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
@@ -357,14 +418,21 @@ async def cmd_help(message: Message):
         "📚 *Доступные команды:*\n\n"
         "/start - Начать работу и авторизоваться\n"
         "/list - Показать содержимое папки\n"
+        "/logout - Выйти из аккаунта Яндекс\n"
         "/help - Показать эту справку\n\n"
-        "*Как работать:*\n"
-        "1. Нажмите /start и перейдите по ссылке для авторизации\n"
-        "2. Скопируйте код из адресной строки после авторизации\n"
-        "3. Отправьте код боту\n"
-        "4. Используйте /list для просмотра файлов и папок\n"
-        "5. Нажимайте на файлы для скачивания\n\n"
-        f"📁 *Путь на диске:* `{YANDEX_FOLDER_PATH}`"
+        "*🔐 Как авторизоваться:*\n"
+        "1️⃣ Нажмите /start\n"
+        "2️⃣ Нажмите кнопку 'Авторизоваться в Яндекс'\n"
+        "3️⃣ Войдите в свой аккаунт Яндекс\n"
+        "4️⃣ Скопируйте код из адресной строки\n"
+        "   (он выглядит как длинная строка букв и цифр)\n"
+        "5️⃣ Отправьте этот код боту\n\n"
+        "*📁 Как работать:*\n"
+        "• После авторизации используйте /list\n"
+        "• Нажимайте на папки для навигации\n"
+        "• Нажимайте на файлы для скачивания\n\n"
+        f"📁 *Текущая папка на диске:*\n"
+        f"`{YANDEX_FOLDER_PATH}`"
     )
     
     await message.answer(help_text, parse_mode="Markdown")
@@ -372,6 +440,7 @@ async def cmd_help(message: Message):
 async def main():
     """Основная функция запуска бота"""
     logger.info("Запуск бота...")
+    logger.info(f"Путь к папке на Яндекс.Диске: {YANDEX_FOLDER_PATH}")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
