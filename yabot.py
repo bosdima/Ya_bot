@@ -161,52 +161,6 @@ def format_size(size: int) -> str:
         size /= 1024.0
     return f"{size:.1f} ТБ"
 
-def create_items_keyboard(items: list, path: str, is_root: bool = False) -> InlineKeyboardMarkup:
-    """Создание клавиатуры с файлами и папками"""
-    keyboard = []
-    
-    # Кнопка "Назад" если не в корневой папке
-    if not is_root and path != "/" and path != YANDEX_FOLDER_PATH:
-        parent_path = "/".join(path.split("/")[:-1]) if path and path != "/" else "/"
-        if not parent_path:
-            parent_path = "/"
-        back_button = InlineKeyboardButton(
-            text="📁 Назад",
-            callback_data=f"folder:{parent_path}"
-        )
-        keyboard.append([back_button])
-    
-    # Сортировка: сначала папки, потом файлы
-    folders = [item for item in items if item.get('type') == 'dir']
-    files = [item for item in items if item.get('type') == 'file']
-    
-    # Добавляем папки
-    for folder in folders:
-        folder_name = folder.get('name', 'Без названия')
-        folder_path = folder.get('path', '')
-        keyboard.append([
-            InlineKeyboardButton(
-                text=f"📁 {folder_name}",
-                callback_data=f"folder:{folder_path}"
-            )
-        ])
-    
-    # Добавляем файлы
-    for file in files:
-        file_name = file.get('name', 'Без названия')
-        file_size = format_size(file.get('size', 0))
-        keyboard.append([
-            InlineKeyboardButton(
-                text=f"📄 {file_name} ({file_size})",
-                callback_data=f"file:{file.get('path', '')}"
-            )
-        ])
-    
-    if not items:
-        keyboard.append([InlineKeyboardButton(text="📂 Папка пуста", callback_data="empty")])
-    
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
-
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     """Обработчик команды /start"""
@@ -261,7 +215,84 @@ async def cmd_list(message: Message):
         )
         return
     
-    await show_folder_contents(message, YANDEX_FOLDER_PATH, is_root=True)
+    # Отправляем сообщение о начале загрузки
+    status_msg = await message.answer(f"📂 Загружаю содержимое папки...")
+    
+    try:
+        disk_api = YandexDiskAPI(user_tokens[user_id])
+        contents = await disk_api.get_folder_contents(YANDEX_FOLDER_PATH)
+        
+        if not contents:
+            await status_msg.edit_text(
+                f"❌ Не удалось получить содержимое папки.\n\n"
+                f"Путь: `{YANDEX_FOLDER_PATH}`\n\n"
+                f"Попробуйте использовать /listroot для просмотра корневой папки",
+                parse_mode="Markdown"
+            )
+            return
+        
+        items = contents.get("_embedded", {}).get("items", [])
+        
+        if not items:
+            await status_msg.edit_text("📂 Папка пуста")
+            return
+        
+        # Удаляем сообщение о загрузке
+        await status_msg.delete()
+        
+        # Создаем клавиатуру
+        keyboard = []
+        
+        # Сначала папки
+        for item in items:
+            if item.get('type') == 'dir':
+                folder_name = item.get('name', 'Без названия')
+                folder_path = item.get('path', '')
+                keyboard.append([InlineKeyboardButton(
+                    text=f"📁 {folder_name}",
+                    callback_data=f"folder:{folder_path}"
+                )])
+        
+        # Потом файлы
+        for item in items:
+            if item.get('type') == 'file':
+                file_name = item.get('name', 'Без названия')
+                file_size = format_size(item.get('size', 0))
+                file_path = item.get('path', '')
+                keyboard.append([InlineKeyboardButton(
+                    text=f"📄 {file_name} ({file_size})",
+                    callback_data=f"file:{file_path}"
+                )])
+        
+        # Добавляем кнопку обновления
+        keyboard.append([InlineKeyboardButton(
+            text="🔄 Обновить",
+            callback_data="refresh"
+        )])
+        
+        inline_kb = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        
+        # Подсчитываем статистику
+        folders_count = len([i for i in items if i.get('type') == 'dir'])
+        files_count = len([i for i in items if i.get('type') == 'file'])
+        
+        # Отправляем сообщение с содержимым
+        await message.answer(
+            f"📁 *Содержимое папки:*\n"
+            f"`{YANDEX_FOLDER_PATH}`\n\n"
+            f"📊 *Найдено элементов:* {len(items)}\n"
+            f"📁 *Папок:* {folders_count}\n"
+            f"📄 *Файлов:* {files_count}",
+            reply_markup=inline_kb,
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка в /list: {e}", exc_info=True)
+        await status_msg.edit_text(
+            f"❌ Произошла ошибка при загрузке: {str(e)}\n\n"
+            f"Пожалуйста, попробуйте позже или используйте /checkpath для диагностики."
+        )
 
 @dp.message(Command("checkpath"))
 async def cmd_check_path(message: Message):
@@ -272,22 +303,27 @@ async def cmd_check_path(message: Message):
         await message.answer("⚠️ Сначала авторизуйтесь с помощью /start")
         return
     
-    await message.answer(f"🔍 Проверяю путь: `{YANDEX_FOLDER_PATH}`", parse_mode="Markdown")
+    status_msg = await message.answer(f"🔍 Проверяю путь: `{YANDEX_FOLDER_PATH}`", parse_mode="Markdown")
     
     disk_api = YandexDiskAPI(user_tokens[user_id])
     contents = await disk_api.get_folder_contents(YANDEX_FOLDER_PATH)
     
     if contents:
         items = contents.get("_embedded", {}).get("items", [])
-        await message.answer(
+        folders_count = len([i for i in items if i.get('type') == 'dir'])
+        files_count = len([i for i in items if i.get('type') == 'file'])
+        
+        await status_msg.edit_text(
             f"✅ Папка найдена!\n\n"
             f"📁 Путь: `{YANDEX_FOLDER_PATH}`\n"
-            f"📊 Количество элементов: {len(items)}\n\n"
+            f"📊 Всего элементов: {len(items)}\n"
+            f"📁 Папок: {folders_count}\n"
+            f"📄 Файлов: {files_count}\n\n"
             f"Используйте /list для просмотра содержимого",
             parse_mode="Markdown"
         )
     else:
-        await message.answer(
+        await status_msg.edit_text(
             f"❌ Папка не найдена!\n\n"
             f"Проверенный путь: `{YANDEX_FOLDER_PATH}`\n\n"
             f"Возможные причины:\n"
@@ -307,8 +343,63 @@ async def cmd_list_root(message: Message):
         await message.answer("⚠️ Сначала авторизуйтесь с помощью /start")
         return
     
-    await message.answer("📂 Загружаю содержимое корневой папки...")
-    await show_folder_contents(message, "/", is_root=True)
+    status_msg = await message.answer("📂 Загружаю содержимое корневой папки...")
+    
+    try:
+        disk_api = YandexDiskAPI(user_tokens[user_id])
+        contents = await disk_api.get_folder_contents("/")
+        
+        if not contents:
+            await status_msg.edit_text("❌ Не удалось получить содержимое корневой папки")
+            return
+        
+        items = contents.get("_embedded", {}).get("items", [])
+        
+        if not items:
+            await status_msg.edit_text("📂 Корневая папка пуста")
+            return
+        
+        await status_msg.delete()
+        
+        # Создаем клавиатуру
+        keyboard = []
+        
+        for item in items:
+            if item.get('type') == 'dir':
+                folder_name = item.get('name', 'Без названия')
+                folder_path = item.get('path', '')
+                keyboard.append([InlineKeyboardButton(
+                    text=f"📁 {folder_name}",
+                    callback_data=f"folder:{folder_path}"
+                )])
+        
+        for item in items:
+            if item.get('type') == 'file':
+                file_name = item.get('name', 'Без названия')
+                file_size = format_size(item.get('size', 0))
+                file_path = item.get('path', '')
+                keyboard.append([InlineKeyboardButton(
+                    text=f"📄 {file_name} ({file_size})",
+                    callback_data=f"file:{file_path}"
+                )])
+        
+        inline_kb = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        
+        folders_count = len([i for i in items if i.get('type') == 'dir'])
+        files_count = len([i for i in items if i.get('type') == 'file'])
+        
+        await message.answer(
+            f"📁 *Корневая папка Яндекс.Диска*\n\n"
+            f"📊 *Найдено элементов:* {len(items)}\n"
+            f"📁 *Папок:* {folders_count}\n"
+            f"📄 *Файлов:* {files_count}",
+            reply_markup=inline_kb,
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка в /listroot: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Ошибка: {str(e)}")
 
 @dp.message(Command("logout"))
 async def cmd_logout(message: Message):
@@ -326,48 +417,33 @@ async def cmd_logout(message: Message):
     else:
         await message.answer("Вы не были авторизованы.")
 
-async def show_folder_contents(message: Message, folder_path: str, is_root: bool = False):
-    """Показать содержимое папки"""
-    user_id = message.from_user.id
-    token = user_tokens[user_id]
-    
-    disk_api = YandexDiskAPI(token)
-    
-    # Отправляем сообщение о загрузке
-    loading_msg = await message.answer(f"📂 Загружаю содержимое папки...")
-    
-    contents = await disk_api.get_folder_contents(folder_path)
-    
-    if not contents:
-        await loading_msg.edit_text(
-            "❌ Ошибка получения содержимого папки.\n\n"
-            "Возможно, папка не существует или у вас нет прав доступа.\n\n"
-            f"Проверенный путь: `{folder_path}`\n\n"
-            "Попробуйте:\n"
-            "1. Использовать /checkpath для диагностики\n"
-            "2. Использовать /listroot для просмотра корневой папки\n"
-            "3. Проверить правильность пути",
-            parse_mode="Markdown"
-        )
-        return
-    
-    items = contents.get("_embedded", {}).get("items", [])
-    
-    if not items:
-        await loading_msg.edit_text("📂 Папка пуста")
-        return
-    
-    await loading_msg.delete()
-    
-    keyboard = create_items_keyboard(items, folder_path, is_root)
-    folder_name = folder_path.split("/")[-1] if folder_path and folder_path != "/" else "Корень"
-    
-    await message.answer(
-        f"📁 *Содержимое папки:* `{folder_name}`\n"
-        f"📊 *Всего элементов:* {len(items)}",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    """Обработчик команды /help"""
+    help_text = (
+        "📚 *Доступные команды:*\n\n"
+        "/start - Начать работу и авторизоваться\n"
+        "/list - Показать содержимое папки\n"
+        "/checkpath - Проверить существование папки\n"
+        "/listroot - Показать корневую папку диска\n"
+        "/logout - Выйти из аккаунта Яндекс\n"
+        "/help - Показать эту справку\n\n"
+        "*🔐 Как авторизоваться:*\n"
+        "1️⃣ Нажмите /start\n"
+        "2️⃣ Нажмите кнопку 'Авторизоваться в Яндекс'\n"
+        "3️⃣ Войдите в свой аккаунт Яндекс\n"
+        "4️⃣ Скопируйте код из адресной строки\n"
+        "5️⃣ Отправьте этот код боту\n\n"
+        "*📁 Как работать:*\n"
+        "• После авторизации используйте /list\n"
+        "• Нажимайте на папки для навигации\n"
+        "• Нажимайте на файлы для скачивания\n"
+        "• Используйте кнопку 'Обновить' для обновления\n\n"
+        f"📁 *Текущая папка на диске:*\n"
+        f"`{YANDEX_FOLDER_PATH}`"
     )
+    
+    await message.answer(help_text, parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("folder:"))
 async def handle_folder_callback(callback: CallbackQuery):
@@ -381,14 +457,87 @@ async def handle_folder_callback(callback: CallbackQuery):
     
     await callback.answer()
     
-    # Отправляем новое сообщение с содержимым папки
-    await show_folder_contents(callback.message, folder_path)
+    status_msg = await callback.message.answer(f"📂 Открываю папку...")
     
-    # Удаляем предыдущее сообщение с клавиатурой
     try:
-        await callback.message.delete()
+        disk_api = YandexDiskAPI(user_tokens[user_id])
+        contents = await disk_api.get_folder_contents(folder_path)
+        
+        if not contents:
+            await status_msg.edit_text("❌ Не удалось открыть папку")
+            return
+        
+        items = contents.get("_embedded", {}).get("items", [])
+        
+        # Создаем клавиатуру
+        keyboard = []
+        
+        # Кнопка назад (если не корневая папка)
+        if folder_path != "/":
+            parent_path = "/".join(folder_path.split("/")[:-1]) if folder_path != "/" else "/"
+            if not parent_path:
+                parent_path = "/"
+            keyboard.append([InlineKeyboardButton(
+                text="📁 Назад",
+                callback_data=f"folder:{parent_path}"
+            )])
+        
+        # Добавляем папки
+        for item in items:
+            if item.get('type') == 'dir':
+                folder_name = item.get('name', 'Без названия')
+                item_path = item.get('path', '')
+                keyboard.append([InlineKeyboardButton(
+                    text=f"📁 {folder_name}",
+                    callback_data=f"folder:{item_path}"
+                )])
+        
+        # Добавляем файлы
+        for item in items:
+            if item.get('type') == 'file':
+                file_name = item.get('name', 'Без названия')
+                file_size = format_size(item.get('size', 0))
+                file_path = item.get('path', '')
+                keyboard.append([InlineKeyboardButton(
+                    text=f"📄 {file_name} ({file_size})",
+                    callback_data=f"file:{file_path}"
+                )])
+        
+        if not items:
+            keyboard.append([InlineKeyboardButton(text="📂 Папка пуста", callback_data="empty")])
+        
+        # Добавляем кнопку обновления
+        keyboard.append([InlineKeyboardButton(
+            text="🔄 Обновить",
+            callback_data=f"refresh_folder:{folder_path}"
+        )])
+        
+        inline_kb = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        
+        folder_name = folder_path.split("/")[-1] if folder_path != "/" else "Корень"
+        folders_count = len([i for i in items if i.get('type') == 'dir'])
+        files_count = len([i for i in items if i.get('type') == 'file'])
+        
+        await status_msg.delete()
+        
+        await callback.message.answer(
+            f"📁 *Папка:* `{folder_name}`\n"
+            f"📊 *Элементов:* {len(items)}\n"
+            f"📁 *Папок:* {folders_count}\n"
+            f"📄 *Файлов:* {files_count}",
+            reply_markup=inline_kb,
+            parse_mode="Markdown"
+        )
+        
+        # Удаляем предыдущее сообщение
+        try:
+            await callback.message.delete()
+        except Exception as e:
+            logger.error(f"Ошибка удаления сообщения: {e}")
+            
     except Exception as e:
-        logger.error(f"Ошибка удаления сообщения: {e}")
+        logger.error(f"Ошибка при открытии папки: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Ошибка: {str(e)}")
 
 @dp.callback_query(F.data.startswith("file:"))
 async def handle_file_callback(callback: CallbackQuery):
@@ -436,8 +585,156 @@ async def handle_file_callback(callback: CallbackQuery):
         await status_message.delete()
         
     except Exception as e:
-        logger.error(f"Ошибка при скачивании файла: {e}")
+        logger.error(f"Ошибка при скачивании файла: {e}", exc_info=True)
         await status_message.edit_text(f"❌ Произошла ошибка: {str(e)}")
+
+@dp.callback_query(F.data == "refresh")
+async def handle_refresh_callback(callback: CallbackQuery):
+    """Обработка обновления содержимого корневой папки"""
+    user_id = callback.from_user.id
+    
+    if user_id not in user_tokens:
+        await callback.answer("⚠️ Сессия истекла. Используйте /start", show_alert=True)
+        return
+    
+    await callback.answer("🔄 Обновляю...")
+    
+    try:
+        disk_api = YandexDiskAPI(user_tokens[user_id])
+        contents = await disk_api.get_folder_contents(YANDEX_FOLDER_PATH)
+        
+        if not contents:
+            await callback.message.edit_text("❌ Не удалось обновить содержимое папки")
+            return
+        
+        items = contents.get("_embedded", {}).get("items", [])
+        
+        # Создаем клавиатуру
+        keyboard = []
+        
+        for item in items:
+            if item.get('type') == 'dir':
+                folder_name = item.get('name', 'Без названия')
+                folder_path = item.get('path', '')
+                keyboard.append([InlineKeyboardButton(
+                    text=f"📁 {folder_name}",
+                    callback_data=f"folder:{folder_path}"
+                )])
+        
+        for item in items:
+            if item.get('type') == 'file':
+                file_name = item.get('name', 'Без названия')
+                file_size = format_size(item.get('size', 0))
+                file_path = item.get('path', '')
+                keyboard.append([InlineKeyboardButton(
+                    text=f"📄 {file_name} ({file_size})",
+                    callback_data=f"file:{file_path}"
+                )])
+        
+        keyboard.append([InlineKeyboardButton(
+            text="🔄 Обновить",
+            callback_data="refresh"
+        )])
+        
+        inline_kb = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        
+        folders_count = len([i for i in items if i.get('type') == 'dir'])
+        files_count = len([i for i in items if i.get('type') == 'file'])
+        
+        await callback.message.edit_text(
+            f"📁 *Содержимое папки:*\n"
+            f"`{YANDEX_FOLDER_PATH}`\n\n"
+            f"📊 *Найдено элементов:* {len(items)}\n"
+            f"📁 *Папок:* {folders_count}\n"
+            f"📄 *Файлов:* {files_count}",
+            reply_markup=inline_kb,
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении: {e}", exc_info=True)
+        await callback.message.edit_text(f"❌ Ошибка обновления: {str(e)}")
+
+@dp.callback_query(F.data.startswith("refresh_folder:"))
+async def handle_refresh_folder_callback(callback: CallbackQuery):
+    """Обработка обновления содержимого папки"""
+    folder_path = callback.data[15:]  # Убираем "refresh_folder:"
+    user_id = callback.from_user.id
+    
+    if user_id not in user_tokens:
+        await callback.answer("⚠️ Сессия истекла. Используйте /start", show_alert=True)
+        return
+    
+    await callback.answer("🔄 Обновляю...")
+    
+    try:
+        disk_api = YandexDiskAPI(user_tokens[user_id])
+        contents = await disk_api.get_folder_contents(folder_path)
+        
+        if not contents:
+            await callback.message.edit_text("❌ Не удалось обновить содержимое папки")
+            return
+        
+        items = contents.get("_embedded", {}).get("items", [])
+        
+        # Создаем клавиатуру
+        keyboard = []
+        
+        # Кнопка назад
+        if folder_path != "/":
+            parent_path = "/".join(folder_path.split("/")[:-1]) if folder_path != "/" else "/"
+            if not parent_path:
+                parent_path = "/"
+            keyboard.append([InlineKeyboardButton(
+                text="📁 Назад",
+                callback_data=f"folder:{parent_path}"
+            )])
+        
+        for item in items:
+            if item.get('type') == 'dir':
+                folder_name = item.get('name', 'Без названия')
+                item_path = item.get('path', '')
+                keyboard.append([InlineKeyboardButton(
+                    text=f"📁 {folder_name}",
+                    callback_data=f"folder:{item_path}"
+                )])
+        
+        for item in items:
+            if item.get('type') == 'file':
+                file_name = item.get('name', 'Без названия')
+                file_size = format_size(item.get('size', 0))
+                file_path = item.get('path', '')
+                keyboard.append([InlineKeyboardButton(
+                    text=f"📄 {file_name} ({file_size})",
+                    callback_data=f"file:{file_path}"
+                )])
+        
+        if not items:
+            keyboard.append([InlineKeyboardButton(text="📂 Папка пуста", callback_data="empty")])
+        
+        keyboard.append([InlineKeyboardButton(
+            text="🔄 Обновить",
+            callback_data=f"refresh_folder:{folder_path}"
+        )])
+        
+        inline_kb = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        
+        folder_name = folder_path.split("/")[-1] if folder_path != "/" else "Корень"
+        folders_count = len([i for i in items if i.get('type') == 'dir'])
+        files_count = len([i for i in items if i.get('type') == 'file'])
+        
+        await callback.message.edit_text(
+            f"📁 *Папка:* `{folder_name}`\n"
+            f"📊 *Элементов:* {len(items)}\n"
+            f"📁 *Папок:* {folders_count}\n"
+            f"📄 *Файлов:* {files_count}",
+            reply_markup=inline_kb,
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении папки: {e}", exc_info=True)
+        await callback.message.edit_text(f"❌ Ошибка обновления: {str(e)}")
 
 @dp.callback_query(F.data == "empty")
 async def handle_empty_callback(callback: CallbackQuery):
@@ -469,7 +766,7 @@ async def handle_auth_code(message: Message):
             )
             
             # Показываем содержимое папки сразу после авторизации
-            await show_folder_contents(message, YANDEX_FOLDER_PATH, is_root=True)
+            await cmd_list(message)
         else:
             await status_msg.edit_text(
                 "❌ Ошибка авторизации.\n\n"
@@ -491,34 +788,6 @@ async def handle_auth_code(message: Message):
                 "4. Отправьте код мне\n\n"
                 "Или используйте /help для списка команд."
             )
-
-@dp.message(Command("help"))
-async def cmd_help(message: Message):
-    """Обработчик команды /help"""
-    help_text = (
-        "📚 *Доступные команды:*\n\n"
-        "/start - Начать работу и авторизоваться\n"
-        "/list - Показать содержимое папки\n"
-        "/checkpath - Проверить существование папки\n"
-        "/listroot - Показать корневую папку диска\n"
-        "/logout - Выйти из аккаунта Яндекс\n"
-        "/help - Показать эту справку\n\n"
-        "*🔐 Как авторизоваться:*\n"
-        "1️⃣ Нажмите /start\n"
-        "2️⃣ Нажмите кнопку 'Авторизоваться в Яндекс'\n"
-        "3️⃣ Войдите в свой аккаунт Яндекс\n"
-        "4️⃣ Скопируйте код из адресной строки\n"
-        "   (он выглядит как длинная строка букв и цифр)\n"
-        "5️⃣ Отправьте этот код боту\n\n"
-        "*📁 Как работать:*\n"
-        "• После авторизации используйте /list\n"
-        "• Нажимайте на папки для навигации\n"
-        "• Нажимайте на файлы для скачивания\n\n"
-        f"📁 *Текущая папка на диске:*\n"
-        f"`{YANDEX_FOLDER_PATH}`"
-    )
-    
-    await message.answer(help_text, parse_mode="Markdown")
 
 async def main():
     """Основная функция запуска бота"""
