@@ -85,6 +85,7 @@ def export_settings(user_id: int) -> str:
         "user_id": user_id,
         "folder_path": settings.get("folder_path", DEFAULT_YANDEX_FOLDER_PATH),
         "check_interval_minutes": settings.get("check_interval_minutes", 60),
+        "auto_check_enabled": settings.get("auto_check_enabled", True),
         "last_check": settings.get("last_check", None)
     }
     return json.dumps(export_data, ensure_ascii=False, indent=2)
@@ -101,6 +102,8 @@ def import_settings(user_id: int, settings_json: str) -> bool:
             user_settings[user_id]["folder_path"] = data["folder_path"]
         if "check_interval_minutes" in data:
             user_settings[user_id]["check_interval_minutes"] = data["check_interval_minutes"]
+        if "auto_check_enabled" in data:
+            user_settings[user_id]["auto_check_enabled"] = data["auto_check_enabled"]
         
         save_settings()
         return True
@@ -119,6 +122,11 @@ def get_user_interval(user_id: int) -> int:
     return user_settings.get(user_id, {}).get("check_interval_minutes", 60)
 
 
+def get_auto_check_enabled(user_id: int) -> bool:
+    """Получить статус автопроверки для пользователя"""
+    return user_settings.get(user_id, {}).get("auto_check_enabled", True)
+
+
 def set_user_folder_path(user_id: int, path: str):
     """Установить путь к папке для пользователя"""
     if user_id not in user_settings:
@@ -135,6 +143,23 @@ def set_user_interval(user_id: int, minutes: int):
     save_settings()
 
 
+def set_auto_check_enabled(user_id: int, enabled: bool):
+    """Установить статус автопроверки для пользователя"""
+    if user_id not in user_settings:
+        user_settings[user_id] = {}
+    user_settings[user_id]["auto_check_enabled"] = enabled
+    save_settings()
+    
+    # Если автопроверка выключена, останавливаем мониторинг
+    if not enabled and user_id in monitoring_tasks:
+        if not monitoring_tasks[user_id].done():
+            monitoring_tasks[user_id].cancel()
+            logger.info(f"Мониторинг остановлен для пользователя {user_id}")
+    # Если включена - запускаем
+    elif enabled and user_id in user_tokens:
+        asyncio.create_task(start_monitoring(user_id))
+
+
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     """Получить основную клавиатуру с кнопками"""
     buttons = [
@@ -146,11 +171,19 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 
-def get_settings_keyboard() -> ReplyKeyboardMarkup:
-    """Получить клавиатуру настроек"""
+def get_settings_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    """Получить клавиатуру настроек с учетом статуса автопроверки"""
+    auto_check_enabled = get_auto_check_enabled(user_id)
+    
+    if auto_check_enabled:
+        auto_check_button = "✅ Автопроверка включена"
+    else:
+        auto_check_button = "❌ Автопроверка выключена"
+    
     buttons = [
         [KeyboardButton(text="📁 Указать путь к папке")],
         [KeyboardButton(text="⏱️ Указать интервал проверки (мин)")],
+        [KeyboardButton(text=auto_check_button)],
         [KeyboardButton(text="📤 Экспорт настроек")],
         [KeyboardButton(text="📥 Импорт настроек")],
         [KeyboardButton(text="◀️ Назад")]
@@ -268,6 +301,11 @@ def format_size(size: int) -> str:
 
 async def check_folder_and_notify(user_id: int):
     """Проверка папки и отправка уведомления"""
+    # Проверяем, включена ли автопроверка
+    if not get_auto_check_enabled(user_id):
+        logger.info(f"Автопроверка выключена для пользователя {user_id}, пропускаем проверку")
+        return
+    
     token = user_tokens.get(user_id)
     if not token:
         return
@@ -305,12 +343,22 @@ async def check_folder_and_notify(user_id: int):
 
 async def start_monitoring(user_id: int):
     """Запуск периодического мониторинга"""
+    # Проверяем, включена ли автопроверка
+    if not get_auto_check_enabled(user_id):
+        logger.info(f"Автопроверка выключена для пользователя {user_id}, мониторинг не запускается")
+        return
+    
     # Останавливаем существующую задачу
     if user_id in monitoring_tasks and not monitoring_tasks[user_id].done():
         monitoring_tasks[user_id].cancel()
     
     async def monitor():
         while True:
+            # Проверяем статус автопроверки перед каждой итерацией
+            if not get_auto_check_enabled(user_id):
+                logger.info(f"Автопроверка выключена для пользователя {user_id}, мониторинг остановлен")
+                break
+            
             interval_minutes = get_user_interval(user_id)
             await asyncio.sleep(interval_minutes * 60)
             await check_folder_and_notify(user_id)
@@ -413,14 +461,16 @@ async def button_settings(message: Message):
     
     folder_path = get_user_folder_path(user_id)
     interval = get_user_interval(user_id)
+    auto_check_status = "✅ Включена" if get_auto_check_enabled(user_id) else "❌ Выключена"
     
     await message.answer(
         f"⚙️ *Настройки*\n\n"
         f"📁 Папка: `{folder_path}`\n"
-        f"⏱️ Интервал: {interval} мин.\n\n"
+        f"⏱️ Интервал: {interval} мин.\n"
+        f"🔄 Автопроверка: {auto_check_status}\n\n"
         f"Выберите действие:",
         parse_mode="Markdown",
-        reply_markup=get_settings_keyboard()
+        reply_markup=get_settings_keyboard(user_id)
     )
 
 
@@ -486,6 +536,35 @@ async def button_set_interval(message: Message):
     )
 
 
+@dp.message(F.text == "✅ Автопроверка включена")
+@dp.message(F.text == "❌ Автопроверка выключена")
+async def button_toggle_auto_check(message: Message):
+    """Переключение статуса автопроверки"""
+    user_id = message.from_user.id
+    if user_id not in user_tokens:
+        await message.answer("⚠️ Сначала авторизуйтесь: /start")
+        return
+    
+    current_status = get_auto_check_enabled(user_id)
+    new_status = not current_status
+    
+    set_auto_check_enabled(user_id, new_status)
+    
+    if new_status:
+        await message.answer("✅ Автопроверка ВКЛЮЧЕНА")
+        # Запускаем мониторинг
+        await start_monitoring(user_id)
+    else:
+        await message.answer("❌ Автопроверка ВЫКЛЮЧЕНА")
+        # Останавливаем мониторинг, если он запущен
+        if user_id in monitoring_tasks and not monitoring_tasks[user_id].done():
+            monitoring_tasks[user_id].cancel()
+            logger.info(f"Мониторинг остановлен для пользователя {user_id}")
+    
+    # Обновляем клавиатуру настроек
+    await button_settings(message)
+
+
 @dp.message(F.text == "📤 Экспорт настроек")
 async def button_export_settings(message: Message):
     user_id = message.from_user.id
@@ -539,7 +618,8 @@ async def cmd_start(message: Message):
         await message.answer(
             f"✅ Вы уже авторизованы!\n\n"
             f"📁 Папка: `{get_user_folder_path(user_id)}`\n"
-            f"⏱️ Интервал: {get_user_interval(user_id)} мин.\n\n"
+            f"⏱️ Интервал: {get_user_interval(user_id)} мин.\n"
+            f"🔄 Автопроверка: {'✅ Включена' if get_auto_check_enabled(user_id) else '❌ Выключена'}\n\n"
             f"Используйте кнопки ниже:",
             parse_mode="Markdown",
             reply_markup=get_main_keyboard()
@@ -624,8 +704,8 @@ async def handle_text_input(message: Message):
             del auth_states[user_id]
             await message.answer(f"✅ Интервал изменен на {minutes} мин.", reply_markup=get_main_keyboard())
             
-            # Перезапускаем мониторинг
-            if user_id in user_tokens:
+            # Перезапускаем мониторинг, если автопроверка включена
+            if user_id in user_tokens and get_auto_check_enabled(user_id):
                 await start_monitoring(user_id)
         except ValueError:
             await message.answer("❌ Введите целое число (минуты)")
@@ -648,6 +728,8 @@ async def handle_text_input(message: Message):
                 user_settings[user_id]["folder_path"] = DEFAULT_YANDEX_FOLDER_PATH
             if "check_interval_minutes" not in user_settings[user_id]:
                 user_settings[user_id]["check_interval_minutes"] = 60
+            if "auto_check_enabled" not in user_settings[user_id]:
+                user_settings[user_id]["auto_check_enabled"] = True
             save_settings()
             
             await status_msg.delete()
@@ -657,8 +739,9 @@ async def handle_text_input(message: Message):
                 reply_markup=get_main_keyboard()
             )
             
-            # Запускаем мониторинг
-            await start_monitoring(user_id)
+            # Запускаем мониторинг, если автопроверка включена
+            if get_auto_check_enabled(user_id):
+                await start_monitoring(user_id)
             
             # Показываем папку
             await show_folder(message, get_user_folder_path(user_id))
@@ -690,9 +773,13 @@ async def handle_import_file(message: Message):
         del auth_states[user_id]
         await message.answer("✅ Настройки успешно импортированы!", reply_markup=get_main_keyboard())
         
-        # Перезапускаем мониторинг
-        if user_id in user_tokens:
+        # Перезапускаем мониторинг, если автопроверка включена
+        if user_id in user_tokens and get_auto_check_enabled(user_id):
             await start_monitoring(user_id)
+        elif user_id in user_tokens and not get_auto_check_enabled(user_id):
+            # Если автопроверка выключена, останавливаем мониторинг
+            if user_id in monitoring_tasks and not monitoring_tasks[user_id].done():
+                monitoring_tasks[user_id].cancel()
     else:
         await message.answer("❌ Ошибка импорта настроек. Проверьте формат файла.")
 
