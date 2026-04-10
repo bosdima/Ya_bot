@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env python3
 """
-Тестовый бот с авторизацией в Яндексе и проверкой CalDAV
-(исправленная версия - без tokeninfo для новых токенов)
+MyUved Bot v5.00 - Telegram бот для уведомлений
+с синхронизацией Яндекс Календаря через CalDAV
 """
 
 import asyncio
@@ -9,23 +9,53 @@ import json
 import os
 import logging
 import base64
-from datetime import datetime
+import uuid
+import re
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Tuple
 from urllib.parse import urlencode
+from io import BytesIO
+from logging.handlers import RotatingFileHandler
 
+import pytz
 import aiohttp
+import requests
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, InputFile
+)
+from aiogram.utils import executor
 from dotenv import load_dotenv
 
-# Загружаем .env
-load_dotenv()
+# ========== НАСТРОЙКИ ==========
+log_file = 'bot_debug.log'
+max_log_size = 100 * 1024  # 100 КБ
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+file_handler = RotatingFileHandler(log_file, maxBytes=max_log_size, backupCount=2, encoding='utf-8')
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+logging.basicConfig(level=logging.DEBUG, handlers=[file_handler, console_handler])
 logger = logging.getLogger(__name__)
 
-# Конфигурация
+# Версия
+BOT_VERSION = "5.00"
+BOT_VERSION_DATE = "10.04.2026"
+
+# Загрузка .env
+load_dotenv()
+
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
 CLIENT_ID = os.getenv('CLIENT_ID')
@@ -33,44 +63,117 @@ CLIENT_SECRET = os.getenv('CLIENT_SECRET')
 REDIRECT_URI = os.getenv('REDIRECT_URI', 'https://oauth.yandex.ru/verification_code')
 YANDEX_EMAIL = os.getenv('YANDEX_EMAIL', '')
 
-# Файл для хранения токена
+if not all([BOT_TOKEN, CLIENT_ID, CLIENT_SECRET]):
+    logger.error("Missing required environment variables!")
+    exit(1)
+
+# Инициализация бота
+storage = MemoryStorage()
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot, storage=storage)
+dp.middleware.setup(LoggingMiddleware())
+
+# Файлы данных
+DATA_FILE = 'notifications.json'
+CONFIG_FILE = 'config.json'
+CALENDAR_SYNC_FILE = 'calendar_sync.json'
 TOKEN_FILE = 'yandex_token.json'
 
+# Глобальные переменные
+notifications: Dict = {}
+config: Dict = {}
+calendar_sync: Dict = {}
+notifications_enabled = True
 
-class Colors:
-    GREEN = '\033[92m'
-    RED = '\033[91m'
-    YELLOW = '\033[93m'
-    CYAN = '\033[96m'
-    BLUE = '\033[94m'
-    BOLD = '\033[1m'
-    END = '\033[0m'
+# Константы
+YANDEX_API_BASE = "https://cloud-api.yandex.net/v1/disk"
+YANDEX_OAUTH_URL = "https://oauth.yandex.ru/authorize"
+CALDAV_URL = "https://caldav.yandex.ru"
 
+TIMEZONES = {
+    'Москва (UTC+3)': 'Europe/Moscow',
+    'Калининград (UTC+2)': 'Europe/Kaliningrad',
+    'Екатеринбург (UTC+5)': 'Asia/Yekaterinburg',
+    'Новосибирск (UTC+7)': 'Asia/Novosibirsk',
+    'Владивосток (UTC+10)': 'Asia/Vladivostok',
+}
 
-def print_header(text: str):
-    print(f"\n{Colors.BOLD}{Colors.BLUE}{'='*60}{Colors.END}")
-    print(f"{Colors.BOLD}{Colors.BLUE} {text}{Colors.END}")
-    print(f"{Colors.BOLD}{Colors.BLUE}{'='*60}{Colors.END}")
-
-
-def print_success(text: str):
-    print(f"{Colors.GREEN}[OK] {text}{Colors.END}")
-
-
-def print_error(text: str):
-    print(f"{Colors.RED}[ERROR] {text}{Colors.END}")
+WEEKDAYS_BUTTONS = [("Пн", 0), ("Вт", 1), ("Ср", 2), ("Чт", 3), ("Пт", 4), ("Сб", 5), ("Вс", 6)]
+WEEKDAYS_NAMES = {0: "Понедельник", 1: "Вторник", 2: "Среда", 3: "Четверг", 4: "Пятница", 5: "Суббота", 6: "Воскресенье"}
 
 
-def print_info(text: str):
-    print(f"{Colors.CYAN}[INFO] {text}{Colors.END}")
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+
+def get_current_time():
+    tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
+    return datetime.now(tz)
 
 
-def print_warning(text: str):
-    print(f"{Colors.YELLOW}[WARN] {text}{Colors.END}")
+def parse_date(date_str: str) -> Optional[datetime]:
+    date_str = date_str.strip()
+    now = get_current_time()
+    current_year = now.year
+    tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
+    
+    # ДД.ММ.ГГГГ ЧЧ:ММ
+    match = re.match(r'^(\d{1,2})\.(\d{1,2})\.(\d{2,4})\s+(\d{1,2}):(\d{2})$', date_str)
+    if match:
+        day, month, year, hour, minute = match.groups()
+        year = int(year)
+        if year < 100:
+            year = 2000 + year
+        try:
+            return tz.localize(datetime(year, int(month), int(day), int(hour), int(minute)))
+        except:
+            return None
+    
+    # ДД.ММ ЧЧ:ММ
+    match = re.match(r'^(\d{1,2})\.(\d{1,2})\s+(\d{1,2}):(\d{2})$', date_str)
+    if match:
+        day, month, hour, minute = match.groups()
+        year = current_year
+        try:
+            result = tz.localize(datetime(year, int(month), int(day), int(hour), int(minute)))
+            if result < now:
+                result = tz.localize(datetime(year + 1, int(month), int(day), int(hour), int(minute)))
+            return result
+        except:
+            return None
+    
+    # ДД.ММ
+    match = re.match(r'^(\d{1,2})\.(\d{1,2})$', date_str)
+    if match:
+        day, month = match.groups()
+        try:
+            result = tz.localize(datetime(current_year, int(month), int(day), now.hour, now.minute))
+            if result < now:
+                result = tz.localize(datetime(current_year + 1, int(month), int(day), now.hour, now.minute))
+            return result
+        except:
+            return None
+    
+    return None
 
 
-def load_token() -> str:
-    """Загружает токен"""
+def get_next_weekday(target_weekdays: List[int], hour: int, minute: int, from_date: datetime = None) -> Optional[datetime]:
+    now = from_date or get_current_time()
+    tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
+    
+    if now.weekday() in target_weekdays:
+        today_trigger = tz.localize(datetime(now.year, now.month, now.day, hour, minute))
+        if today_trigger > now:
+            return today_trigger
+    
+    for i in range(1, 15):
+        next_date = now + timedelta(days=i)
+        if next_date.weekday() in target_weekdays:
+            return tz.localize(datetime(next_date.year, next_date.month, next_date.day, hour, minute))
+    
+    return None
+
+
+def load_token() -> Optional[str]:
+    """Загружает токен Яндекса"""
     token = os.getenv('YANDEX_TOKEN')
     if token and len(token) > 30:
         return token
@@ -86,259 +189,699 @@ def load_token() -> str:
     return None
 
 
-async def test_disk_access(token: str):
-    """Проверяет доступ к Яндекс.Диску"""
-    print_header("YANDEX DISK ACCESS")
-    
-    headers = {"Authorization": f"OAuth {token}"}
-    url = "https://cloud-api.yandex.net/v1/disk"
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url, headers=headers, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    print_success("Disk accessible!")
-                    print_info(f"  User: {data.get('user', {}).get('display_name', 'N/A')}")
-                    used = int(data.get('used_space', 0))
-                    total = int(data.get('total_space', 0))
-                    print_info(f"  Used: {used // (1024**3)} GB / {total // (1024**3)} GB")
-                    return True
-                elif resp.status == 401:
-                    print_error("Disk access: 401 Unauthorized")
-                    return False
-                else:
-                    print_error(f"Disk access error: {resp.status}")
-                    return False
-        except Exception as e:
-            print_error(f"Error: {e}")
-            return False
+# ========== CalDAV КЛАСС ==========
 
-
-async def test_caldav_access(token: str, email: str):
-    """Проверяет доступ к CalDAV"""
-    print_header("CalDAV ACCESS")
+class YandexCalendarAPI:
+    """Работа с Яндекс Календарём через CalDAV"""
     
-    if not email:
-        print_warning("Email not specified")
-        return False
+    def __init__(self, token: str, email: str = None):
+        self.token = token
+        self.email = email or YANDEX_EMAIL
+        self.base_url = CALDAV_URL
+        self._calendar_path = None
     
-    print_info(f"Email: {email}")
+    def _get_headers(self, content_type: str = "application/xml; charset=utf-8", depth: str = None):
+        auth = base64.b64encode(f"{self.email}:{self.token}".encode()).decode()
+        headers = {
+            "Authorization": f"Basic {auth}",
+            "Content-Type": content_type
+        }
+        if depth:
+            headers["Depth"] = depth
+        return headers
     
-    auth_string = f"{email}:{token}"
-    encoded = base64.b64encode(auth_string.encode()).decode()
-    
-    headers = {
-        "Authorization": f"Basic {encoded}",
-        "Content-Type": "application/xml; charset=utf-8",
-        "Depth": "1"
-    }
-    
-    body = '''<?xml version="1.0" encoding="utf-8"?>
+    async def get_calendars(self) -> List[Dict]:
+        """Получает список календарей"""
+        body = '''<?xml version="1.0" encoding="utf-8"?>
 <propfind xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
-  <prop>
-    <displayname/>
-    <resourcetype/>
-  </prop>
+  <prop><displayname/><resourcetype/></prop>
 </propfind>'''
-    
-    url = "https://caldav.yandex.ru/"
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.request("PROPFIND", url, headers=headers, data=body.encode('utf-8'), timeout=15) as resp:
-                print_info(f"Status: {resp.status}")
-                
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.request("PROPFIND", self.base_url + "/", 
+                                       headers=self._get_headers(depth="1"), 
+                                       data=body.encode(), timeout=15) as resp:
                 if resp.status == 207:
-                    print_success("CalDAV WORKS!")
-                    
                     text = await resp.text()
-                    import xml.etree.ElementTree as ET
-                    
-                    try:
-                        root = ET.fromstring(text)
-                        namespaces = {'D': 'DAV:', 'C': 'urn:ietf:params:xml:ns:caldav'}
-                        
-                        calendars = []
-                        for response in root.findall('.//D:response', namespaces):
-                            href = response.find('.//D:href', namespaces)
-                            displayname = response.find('.//D:displayname', namespaces)
-                            resourcetype = response.find('.//D:resourcetype', namespaces)
-                            
-                            if resourcetype is not None:
-                                calendar_tag = resourcetype.find('.//C:calendar', namespaces)
-                                if calendar_tag is not None and href is not None:
-                                    name = displayname.text if displayname is not None else 'Unnamed'
-                                    calendars.append({'path': href.text, 'name': name})
-                        
-                        if calendars:
-                            print_success(f"Found calendars: {len(calendars)}")
-                            for cal in calendars:
-                                print_info(f"  [CAL] {cal['name']}: {cal['path']}")
-                        else:
-                            print_warning("No calendars found")
-                    except Exception as e:
-                        print_warning(f"Parse error: {e}")
-                    
-                    return True
-                    
-                elif resp.status == 401:
-                    print_error("CalDAV: 401 Unauthorized")
-                    print_info("  Check token permissions (calendar:read, calendar:write)")
-                    return False
-                else:
-                    print_error(f"CalDAV status: {resp.status}")
-                    text = await resp.text()
-                    if 'html' in text.lower():
-                        print_error("  Server returned HTML instead of XML")
-                    return False
-                    
-        except Exception as e:
-            print_error(f"Error: {e}")
-            return False
-
-
-async def test_create_event(token: str, email: str):
-    """Тест создания события в календаре"""
-    print_header("TEST CREATE EVENT")
+                    return self._parse_calendars(text)
+                return []
     
-    if not email:
-        print_warning("Email not specified")
-        return False
+    def _parse_calendars(self, xml_text: str) -> List[Dict]:
+        calendars = []
+        try:
+            root = ET.fromstring(xml_text)
+            ns = {'D': 'DAV:', 'C': 'urn:ietf:params:xml:ns:caldav'}
+            
+            for resp in root.findall('.//D:response', ns):
+                href = resp.find('.//D:href', ns)
+                displayname = resp.find('.//D:displayname', ns)
+                resourcetype = resp.find('.//D:resourcetype', ns)
+                
+                if resourcetype is not None and resourcetype.find('.//C:calendar', ns) is not None and href is not None:
+                    calendars.append({
+                        'path': href.text,
+                        'name': displayname.text if displayname is not None else 'Календарь'
+                    })
+        except:
+            pass
+        return calendars
     
-    import uuid
-    from datetime import timedelta
-    import pytz
+    async def get_calendar_path(self) -> str:
+        if self._calendar_path:
+            return self._calendar_path
+        
+        calendars = await self.get_calendars()
+        if calendars:
+            self._calendar_path = calendars[0]['path']
+        else:
+            self._calendar_path = "/default/"
+        
+        return self._calendar_path
     
-    auth_string = f"{email}:{token}"
-    encoded = base64.b64encode(auth_string.encode()).decode()
-    
-    headers = {
-        "Authorization": f"Basic {encoded}",
-        "Content-Type": "text/calendar; charset=utf-8"
-    }
-    
-    # Создаем событие на завтра
-    tz = pytz.timezone('Europe/Moscow')
-    now = datetime.now(tz)
-    start_time = now + timedelta(days=1)
-    start_time = start_time.replace(hour=15, minute=0, second=0, microsecond=0)
-    end_time = start_time + timedelta(hours=1)
-    
-    event_uid = f"{uuid.uuid4()}@test"
-    
-    start_utc = start_time.astimezone(pytz.UTC)
-    end_utc = end_time.astimezone(pytz.UTC)
-    
-    start_str = start_utc.strftime('%Y%m%dT%H%M%SZ')
-    end_str = end_utc.strftime('%Y%m%dT%H%M%SZ')
-    now_str = datetime.now(pytz.UTC).strftime('%Y%m%dT%H%M%SZ')
-    
-    ical_data = f"""BEGIN:VCALENDAR
+    async def create_event(self, summary: str, start_time: datetime, 
+                           end_time: datetime = None, description: str = "") -> Optional[str]:
+        try:
+            calendar_path = await self.get_calendar_path()
+            if not calendar_path.endswith('/'):
+                calendar_path += '/'
+            
+            if end_time is None:
+                end_time = start_time + timedelta(hours=1)
+            
+            tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
+            if start_time.tzinfo is None:
+                start_time = tz.localize(start_time)
+            if end_time.tzinfo is None:
+                end_time = tz.localize(end_time)
+            
+            start_utc = start_time.astimezone(pytz.UTC)
+            end_utc = end_time.astimezone(pytz.UTC)
+            
+            event_uid = f"{uuid.uuid4()}@myuved"
+            start_str = start_utc.strftime('%Y%m%dT%H%M%SZ')
+            end_str = end_utc.strftime('%Y%m%dT%H%M%SZ')
+            now_str = datetime.now(pytz.UTC).strftime('%Y%m%dT%H%M%SZ')
+            
+            # Экранирование
+            safe_summary = summary.replace('\\', '\\\\').replace(';', '\\;').replace(',', '\\,').replace('\n', '\\n')
+            safe_desc = description.replace('\\', '\\\\').replace(';', '\\;').replace(',', '\\,').replace('\n', '\\n')
+            
+            ical = f"""BEGIN:VCALENDAR
 VERSION:2.0
-PRODID:-//Test Bot//RU
+PRODID:-//MyUved Bot//RU
 BEGIN:VEVENT
 UID:{event_uid}
 DTSTAMP:{now_str}
 DTSTART:{start_str}
 DTEND:{end_str}
-SUMMARY:[TEST] CalDAV Event
-DESCRIPTION:Test event from diagnostic bot
+SUMMARY:{safe_summary}
+DESCRIPTION:{safe_desc}
 END:VEVENT
 END:VCALENDAR"""
-    
-    url = f"https://caldav.yandex.ru/default/{event_uid}.ics"
-    
-    print_info(f"Creating test event...")
-    print_info(f"  Time: {start_time.strftime('%d.%m.%Y %H:%M')} - {end_time.strftime('%H:%M')}")
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            # Создаем событие
-            async with session.put(url, headers=headers, data=ical_data.encode('utf-8'), timeout=15) as resp:
-                if resp.status in [201, 204]:
-                    print_success(f"Event created! (status {resp.status})")
-                    print_success(f"  ID: {event_uid}")
-                    
-                    # Удаляем тестовое событие
-                    print_info("Deleting test event...")
-                    async with session.delete(url, headers=headers, timeout=15) as del_resp:
-                        if del_resp.status in [200, 204]:
-                            print_success("Event deleted")
-                        else:
-                            print_warning(f"Could not delete: {del_resp.status}")
-                    
-                    return True
-                else:
-                    print_error(f"Create error: {resp.status}")
-                    text = await resp.text()
-                    print_info(f"Response: {text[:200]}")
-                    return False
-                    
+            
+            url = f"{self.base_url}{calendar_path}{event_uid}.ics"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.put(url, headers=self._get_headers("text/calendar"), 
+                                       data=ical.encode(), timeout=15) as resp:
+                    if resp.status in [201, 204]:
+                        logger.info(f"Created calendar event: {summary}")
+                        return event_uid
+            return None
         except Exception as e:
-            print_error(f"Error: {e}")
+            logger.error(f"Error creating event: {e}")
+            return None
+    
+    async def delete_event(self, event_id: str) -> bool:
+        try:
+            calendar_path = await self.get_calendar_path()
+            if not calendar_path.endswith('/'):
+                calendar_path += '/'
+            
+            url = f"{self.base_url}{calendar_path}{event_id}.ics"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.delete(url, headers=self._get_headers(), timeout=15) as resp:
+                    return resp.status in [200, 204]
+        except:
             return False
 
 
-async def main():
-    print_header("YANDEX CALDAV TEST")
-    print_info(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # Загружаем токен
-    token = load_token()
-    
-    if not token:
-        print_error("Token not found!")
-        print_info("Add YANDEX_TOKEN to .env file")
+# ========== FSM СОСТОЯНИЯ ==========
+
+class AuthStates(StatesGroup):
+    waiting_for_code = State()
+
+
+class NotificationStates(StatesGroup):
+    waiting_for_text = State()
+    waiting_for_time_type = State()
+    waiting_for_hours = State()
+    waiting_for_days = State()
+    waiting_for_specific_date = State()
+    waiting_for_weekdays = State()
+    waiting_for_weekday_time = State()
+    waiting_for_every_day_time = State()
+
+
+# ========== ФУНКЦИИ ДАННЫХ ==========
+
+def init_files():
+    Path('backups').mkdir(exist_ok=True)
+    if not os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'w') as f:
+            json.dump({}, f)
+    if not os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump({'backup_path': '/MyUved_backups', 'max_backups': 5, 
+                       'timezone': 'Europe/Moscow', 'calendar_sync_enabled': False}, f)
+    if not os.path.exists(CALENDAR_SYNC_FILE):
+        with open(CALENDAR_SYNC_FILE, 'w') as f:
+            json.dump({}, f)
+
+
+def load_data():
+    global notifications, config, calendar_sync
+    with open(DATA_FILE, 'r') as f:
+        notifications = json.load(f)
+    with open(CONFIG_FILE, 'r') as f:
+        config = json.load(f)
+    if os.path.exists(CALENDAR_SYNC_FILE):
+        with open(CALENDAR_SYNC_FILE, 'r') as f:
+            calendar_sync = json.load(f)
+
+
+def save_data():
+    with open(DATA_FILE, 'w') as f:
+        json.dump(notifications, f, indent=2, ensure_ascii=False)
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+
+
+def save_calendar_sync():
+    with open(CALENDAR_SYNC_FILE, 'w') as f:
+        json.dump(calendar_sync, f, indent=2, ensure_ascii=False)
+
+
+async def sync_to_calendar(notif_id: str, action: str = 'create'):
+    """Синхронизация уведомления с календарём"""
+    if not config.get('calendar_sync_enabled', False):
         return
     
-    print_header("TOKEN FOUND")
-    print_info(f"Token: {token[:20]}...{token[-10:]}")
-    print_info(f"Length: {len(token)} chars")
+    token = load_token()
+    if not token:
+        return
     
-    if token.startswith('y0_') or token.startswith('y1_'):
-        print_success("Format: new (y0_/y1_) - OK")
-    elif token.startswith('AQAAAA'):
-        print_success("Format: old (AQAAAA) - OK")
+    notif = notifications.get(notif_id)
+    if not notif:
+        return
     
-    # Проверяем Диск
-    disk_ok = await test_disk_access(token)
+    api = YandexCalendarAPI(token)
     
-    # Проверяем CalDAV
-    caldav_ok = await test_caldav_access(token, YANDEX_EMAIL)
+    if action == 'create':
+        event_time = datetime.fromisoformat(notif['time'])
+        event_id = await api.create_event(
+            summary=notif['text'][:100],
+            start_time=event_time,
+            description=f"Уведомление из бота MyUved\nТекст: {notif['text']}"
+        )
+        if event_id:
+            calendar_sync[notif_id] = {'event_id': event_id}
+            save_calendar_sync()
     
-    # Если CalDAV работает, пробуем создать событие
-    if caldav_ok:
-        await test_create_event(token, YANDEX_EMAIL)
-    
-    # Итоги
-    print_header("SUMMARY")
-    
-    if disk_ok:
-        print_success("Yandex Disk: OK")
-    else:
-        print_error("Yandex Disk: FAIL")
-    
-    if caldav_ok:
-        print_success("CalDAV: OK")
-        print_success("\n[SUCCESS] CalDAV is working!")
-        print_success("You can now use the full bot with calendar sync!")
-    else:
-        print_error("CalDAV: FAIL")
-        print_info("\nChecklist:")
-        print_info("  1. Token has calendar:read and calendar:write permissions")
-        print_info("  2. Email is correct: " + YANDEX_EMAIL)
-        print_info("  3. You have at least one calendar at calendar.yandex.ru")
-    
-    print_header("DONE")
+    elif action == 'delete':
+        sync_data = calendar_sync.get(notif_id, {})
+        if sync_data.get('event_id'):
+            await api.delete_event(sync_data['event_id'])
+            del calendar_sync[notif_id]
+            save_calendar_sync()
 
 
-if __name__ == "__main__":
+# ========== КЛАВИАТУРА ==========
+
+def get_main_keyboard():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add(KeyboardButton("➕ Добавить"), KeyboardButton("📋 Список"))
+    kb.add(KeyboardButton("⚙️ Настройки"))
+    return kb
+
+
+# ========== ОБРАБОТЧИКИ ==========
+
+@dp.message_handler(commands=['start'])
+async def cmd_start(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    token = load_token()
+    status = "✅ Авторизован" if token else "❌ Не авторизован"
+    
+    await message.reply(
+        f"🤖 **MyUved Bot v{BOT_VERSION}**\n\n"
+        f"📅 Календарь: {status}\n\n"
+        "Выберите действие:",
+        reply_markup=get_main_keyboard(),
+        parse_mode='Markdown'
+    )
+
+
+@dp.message_handler(lambda m: m.text == "⚙️ Настройки")
+async def settings_menu(message: types.Message):
+    cal_sync = "✅ Вкл" if config.get('calendar_sync_enabled') else "❌ Выкл"
+    
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton(f"📅 Синхр: {cal_sync}", callback_data="toggle_calendar"),
+        InlineKeyboardButton("🔑 Авторизация", callback_data="auth_start")
+    )
+    kb.add(InlineKeyboardButton("🔍 Проверить календарь", callback_data="check_calendar"))
+    kb.add(InlineKeyboardButton("ℹ️ Инфо", callback_data="info"))
+    
+    await message.reply("⚙️ **Настройки**", reply_markup=kb, parse_mode='Markdown')
+
+
+@dp.callback_query_handler(lambda c: c.data == "auth_start")
+async def auth_start(callback: types.CallbackQuery, state: FSMContext):
+    auth_url = f"https://oauth.yandex.ru/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}"
+    
+    await bot.send_message(
+        callback.from_user.id,
+        f"🔑 **Авторизация**\n\n"
+        f"1. [Откройте ссылку]({auth_url})\n"
+        f"2. Разрешите доступ\n"
+        f"3. Скопируйте код из адресной строки\n"
+        f"4. Отправьте код сюда\n\n"
+        f"У вас 3 минуты.",
+        parse_mode='Markdown',
+        disable_web_page_preview=True
+    )
+    await AuthStates.waiting_for_code.set()
+    await callback.answer()
+
+
+@dp.message_handler(state=AuthStates.waiting_for_code)
+async def receive_code(message: types.Message, state: FSMContext):
+    code = message.text.strip()
+    
+    # Обмен кода на токен
+    async with aiohttp.ClientSession() as session:
+        data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET
+        }
+        async with session.post("https://oauth.yandex.ru/token", data=data) as resp:
+            if resp.status == 200:
+                result = await resp.json()
+                token = result.get('access_token')
+                
+                # Сохраняем токен
+                with open(TOKEN_FILE, 'w') as f:
+                    json.dump({'access_token': token}, f)
+                
+                # Обновляем .env
+                env_lines = []
+                if os.path.exists('.env'):
+                    with open('.env', 'r') as f:
+                        env_lines = f.readlines()
+                
+                token_found = False
+                for i, line in enumerate(env_lines):
+                    if line.startswith('YANDEX_TOKEN='):
+                        env_lines[i] = f'YANDEX_TOKEN={token}\n'
+                        token_found = True
+                        break
+                if not token_found:
+                    env_lines.append(f'\nYANDEX_TOKEN={token}\n')
+                
+                with open('.env', 'w') as f:
+                    f.writelines(env_lines)
+                
+                await message.reply("✅ **Авторизация успешна!**", parse_mode='Markdown')
+            else:
+                await message.reply("❌ **Ошибка авторизации**", parse_mode='Markdown')
+    
+    await state.finish()
+
+
+@dp.callback_query_handler(lambda c: c.data == "check_calendar")
+async def check_calendar(callback: types.CallbackQuery):
+    token = load_token()
+    if not token:
+        await callback.answer("Сначала авторизуйтесь!", show_alert=True)
+        return
+    
+    api = YandexCalendarAPI(token)
+    calendars = await api.get_calendars()
+    
+    if calendars:
+        text = f"✅ **Найдено календарей: {len(calendars)}**\n"
+        for cal in calendars[:5]:
+            text += f"• {cal['name']}\n"
+    else:
+        text = "❌ **Календари не найдены**\nСоздайте календарь на calendar.yandex.ru"
+    
+    await bot.send_message(callback.from_user.id, text, parse_mode='Markdown')
+    await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "toggle_calendar")
+async def toggle_calendar(callback: types.CallbackQuery):
+    config['calendar_sync_enabled'] = not config.get('calendar_sync_enabled', False)
+    save_data()
+    status = "включена" if config['calendar_sync_enabled'] else "выключена"
+    await callback.answer(f"Синхронизация {status}")
+    await settings_menu(callback.message)
+
+
+@dp.callback_query_handler(lambda c: c.data == "info")
+async def show_info(callback: types.CallbackQuery):
+    token = load_token()
+    info = f"""
+🤖 **MyUved Bot v{BOT_VERSION}**
+
+📝 Уведомлений: {len(notifications)}
+📅 Синхронизация: {'✅' if config.get('calendar_sync_enabled') else '❌'}
+🔑 Авторизация: {'✅' if token else '❌'}
+🕐 Время: {get_current_time().strftime('%d.%m.%Y %H:%M')}
+"""
+    await callback.message.reply(info, parse_mode='Markdown')
+    await callback.answer()
+
+
+@dp.message_handler(lambda m: m.text == "➕ Добавить")
+async def add_notification_start(message: types.Message):
+    await message.reply("✏️ **Введите текст уведомления:**", parse_mode='Markdown')
+    await NotificationStates.waiting_for_text.set()
+
+
+@dp.message_handler(state=NotificationStates.waiting_for_text)
+async def get_text(message: types.Message, state: FSMContext):
+    await state.update_data(text=message.text)
+    
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("⏰ Часы", callback_data="time_hours"),
+        InlineKeyboardButton("📅 Дни", callback_data="time_days"),
+        InlineKeyboardButton("🗓️ Дата", callback_data="time_specific"),
+        InlineKeyboardButton("🔄 Каждый день", callback_data="time_every_day"),
+        InlineKeyboardButton("📆 Дни недели", callback_data="time_weekdays")
+    )
+    
+    await message.reply("⏱️ **Когда уведомить?**", reply_markup=kb, parse_mode='Markdown')
+    await NotificationStates.waiting_for_time_type.set()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('time_'), state=NotificationStates.waiting_for_time_type)
+async def get_time_type(callback: types.CallbackQuery, state: FSMContext):
+    time_type = callback.data.replace('time_', '')
+    await state.update_data(time_type=time_type)
+    
+    if time_type == 'hours':
+        await callback.message.reply("⌛ **Введите количество часов:**")
+        await NotificationStates.waiting_for_hours.set()
+    elif time_type == 'days':
+        await callback.message.reply("📅 **Введите количество дней:**")
+        await NotificationStates.waiting_for_days.set()
+    elif time_type == 'specific':
+        await callback.message.reply("🗓️ **Введите дату (ДД.ММ ЧЧ:ММ):**")
+        await NotificationStates.waiting_for_specific_date.set()
+    elif time_type == 'every_day':
+        await callback.message.reply("⏰ **Введите время (ЧЧ:ММ):**")
+        await NotificationStates.waiting_for_every_day_time.set()
+    elif time_type == 'weekdays':
+        kb = InlineKeyboardMarkup(row_width=3)
+        for name, day in WEEKDAYS_BUTTONS:
+            kb.insert(InlineKeyboardButton(name, callback_data=f"wd_{day}"))
+        kb.add(InlineKeyboardButton("✅ Готово", callback_data="wd_done"))
+        await state.update_data(selected_weekdays=[])
+        await callback.message.reply("📅 **Выберите дни недели:**", reply_markup=kb)
+        await NotificationStates.waiting_for_weekdays.set()
+    
+    await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('wd_'), state=NotificationStates.waiting_for_weekdays)
+async def select_weekday(callback: types.CallbackQuery, state: FSMContext):
+    day = int(callback.data.replace('wd_', ''))
+    data = await state.get_data()
+    selected = data.get('selected_weekdays', [])
+    
+    if day in selected:
+        selected.remove(day)
+    else:
+        selected.append(day)
+    
+    await state.update_data(selected_weekdays=selected)
+    
+    # Обновляем клавиатуру
+    kb = InlineKeyboardMarkup(row_width=3)
+    for name, d in WEEKDAYS_BUTTONS:
+        text = f"✅ {name}" if d in selected else name
+        kb.insert(InlineKeyboardButton(text, callback_data=f"wd_{d}"))
+    kb.add(InlineKeyboardButton("✅ Готово", callback_data="wd_done"))
+    
+    await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "wd_done", state=NotificationStates.waiting_for_weekdays)
+async def weekdays_done(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected = data.get('selected_weekdays', [])
+    
+    if not selected:
+        await callback.answer("Выберите хотя бы один день!", show_alert=True)
+        return
+    
+    await state.update_data(weekdays_list=selected)
+    await callback.message.reply("⏰ **Введите время (ЧЧ:ММ):**")
+    await NotificationStates.waiting_for_weekday_time.set()
+    await callback.answer()
+
+
+async def save_notification(message: types.Message, state: FSMContext, notify_time: datetime):
+    data = await state.get_data()
+    notif_id = str(len(notifications) + 1)
+    
+    notifications[notif_id] = {
+        'text': data['text'],
+        'time': notify_time.isoformat(),
+        'created': get_current_time().isoformat(),
+        'notified': False,
+        'repeat_type': 'no'
+    }
+    
+    save_data()
+    await sync_to_calendar(notif_id, 'create')
+    
+    await message.reply(
+        f"✅ **Уведомление создано!**\n"
+        f"📝 {data['text']}\n"
+        f"⏰ {notify_time.strftime('%d.%m.%Y %H:%M')}",
+        parse_mode='Markdown'
+    )
+    await state.finish()
+
+
+@dp.message_handler(state=NotificationStates.waiting_for_hours)
+async def set_hours(message: types.Message, state: FSMContext):
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n\nInterrupted")
-    except Exception as e:
-        print_error(f"Critical error: {e}")
-        import traceback
-        traceback.print_exc()
+        hours = int(message.text)
+        notify_time = get_current_time() + timedelta(hours=hours)
+        await save_notification(message, state, notify_time)
+    except:
+        await message.reply("❌ Введите число!")
+
+
+@dp.message_handler(state=NotificationStates.waiting_for_days)
+async def set_days(message: types.Message, state: FSMContext):
+    try:
+        days = int(message.text)
+        notify_time = get_current_time() + timedelta(days=days)
+        await save_notification(message, state, notify_time)
+    except:
+        await message.reply("❌ Введите число!")
+
+
+@dp.message_handler(state=NotificationStates.waiting_for_specific_date)
+async def set_specific_date(message: types.Message, state: FSMContext):
+    notify_time = parse_date(message.text)
+    if notify_time:
+        await save_notification(message, state, notify_time)
+    else:
+        await message.reply("❌ Неверный формат даты!")
+
+
+@dp.message_handler(state=NotificationStates.waiting_for_every_day_time)
+async def set_every_day(message: types.Message, state: FSMContext):
+    match = re.match(r'^(\d{1,2}):(\d{2})$', message.text)
+    if not match:
+        await message.reply("❌ Формат: ЧЧ:ММ")
+        return
+    
+    hour, minute = map(int, match.groups())
+    data = await state.get_data()
+    notif_id = str(len(notifications) + 1)
+    
+    now = get_current_time()
+    tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
+    first_time = tz.localize(datetime(now.year, now.month, now.day, hour, minute))
+    if first_time <= now:
+        first_time += timedelta(days=1)
+    
+    notifications[notif_id] = {
+        'text': data['text'],
+        'time': first_time.isoformat(),
+        'created': now.isoformat(),
+        'notified': False,
+        'repeat_type': 'every_day',
+        'repeat_hour': hour,
+        'repeat_minute': minute,
+        'last_trigger': (first_time - timedelta(days=1)).isoformat()
+    }
+    
+    save_data()
+    await sync_to_calendar(notif_id, 'create')
+    await message.reply(f"✅ **Ежедневное уведомление создано!**\n⏰ {hour:02d}:{minute:02d}", parse_mode='Markdown')
+    await state.finish()
+
+
+@dp.message_handler(state=NotificationStates.waiting_for_weekday_time)
+async def set_weekday_time(message: types.Message, state: FSMContext):
+    match = re.match(r'^(\d{1,2}):(\d{2})$', message.text)
+    if not match:
+        await message.reply("❌ Формат: ЧЧ:ММ")
+        return
+    
+    hour, minute = map(int, match.groups())
+    data = await state.get_data()
+    weekdays = data.get('weekdays_list', [])
+    notif_id = str(len(notifications) + 1)
+    
+    first_time = get_next_weekday(weekdays, hour, minute)
+    
+    notifications[notif_id] = {
+        'text': data['text'],
+        'time': first_time.isoformat(),
+        'created': get_current_time().isoformat(),
+        'notified': False,
+        'repeat_type': 'weekdays',
+        'repeat_hour': hour,
+        'repeat_minute': minute,
+        'weekdays_list': weekdays,
+        'last_trigger': (first_time - timedelta(days=7)).isoformat()
+    }
+    
+    save_data()
+    await sync_to_calendar(notif_id, 'create')
+    
+    days_names = [WEEKDAYS_NAMES[d] for d in sorted(weekdays)]
+    await message.reply(
+        f"✅ **Уведомление создано!**\n"
+        f"📆 {', '.join(days_names)} в {hour:02d}:{minute:02d}",
+        parse_mode='Markdown'
+    )
+    await state.finish()
+
+
+@dp.message_handler(lambda m: m.text == "📋 Список")
+async def list_notifications(message: types.Message):
+    if not notifications:
+        await message.reply("📭 Нет уведомлений")
+        return
+    
+    for notif_id, notif in notifications.items():
+        if notif.get('repeat_type', 'no') != 'no':
+            text = f"🔄 **{notif['text']}**\n"
+            if notif.get('repeat_type') == 'every_day':
+                text += f"⏰ Каждый день в {notif['repeat_hour']:02d}:{notif['repeat_minute']:02d}"
+            elif notif.get('repeat_type') == 'weekdays':
+                days = [WEEKDAYS_NAMES[d] for d in notif.get('weekdays_list', [])]
+                text += f"📆 {', '.join(days)} в {notif['repeat_hour']:02d}:{notif['repeat_minute']:02d}"
+        else:
+            notify_time = datetime.fromisoformat(notif['time'])
+            text = f"⏳ **{notif['text']}**\n⏰ {notify_time.strftime('%d.%m.%Y %H:%M')}"
+        
+        kb = InlineKeyboardMarkup().add(
+            InlineKeyboardButton("🗑️ Удалить", callback_data=f"del_{notif_id}")
+        )
+        await message.reply(text, reply_markup=kb, parse_mode='Markdown')
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('del_'))
+async def delete_notification(callback: types.CallbackQuery):
+    notif_id = callback.data.replace('del_', '')
+    if notif_id in notifications:
+        await sync_to_calendar(notif_id, 'delete')
+        del notifications[notif_id]
+        save_data()
+        await callback.message.edit_text("✅ Удалено")
+    await callback.answer()
+
+
+async def check_notifications_task():
+    """Фоновая проверка уведомлений"""
+    while True:
+        now = get_current_time()
+        
+        for notif_id, notif in list(notifications.items()):
+            repeat_type = notif.get('repeat_type', 'no')
+            
+            if repeat_type == 'no':
+                notify_time = datetime.fromisoformat(notif['time'])
+                if now >= notify_time and not notif.get('notified'):
+                    await bot.send_message(ADMIN_ID, f"🔔 **НАПОМИНАНИЕ**\n\n📝 {notif['text']}")
+                    notifications[notif_id]['notified'] = True
+                    save_data()
+            
+            elif repeat_type == 'every_day':
+                hour = notif['repeat_hour']
+                minute = notif['repeat_minute']
+                last_trigger = datetime.fromisoformat(notif.get('last_trigger', '2000-01-01T00:00:00'))
+                
+                if now.hour == hour and now.minute == minute and last_trigger.date() < now.date():
+                    await bot.send_message(ADMIN_ID, f"🔔 **ЕЖЕДНЕВНОЕ НАПОМИНАНИЕ**\n\n📝 {notif['text']}")
+                    notifications[notif_id]['last_trigger'] = now.isoformat()
+                    save_data()
+            
+            elif repeat_type == 'weekdays':
+                hour = notif['repeat_hour']
+                minute = notif['repeat_minute']
+                weekdays = notif.get('weekdays_list', [])
+                last_trigger = datetime.fromisoformat(notif.get('last_trigger', '2000-01-01T00:00:00'))
+                
+                if (now.weekday() in weekdays and now.hour == hour and now.minute == minute 
+                    and last_trigger.date() < now.date()):
+                    await bot.send_message(ADMIN_ID, f"🔔 **НАПОМИНАНИЕ ПО ДНЯМ**\n\n📝 {notif['text']}")
+                    notifications[notif_id]['last_trigger'] = now.isoformat()
+                    save_data()
+        
+        await asyncio.sleep(30)
+
+
+async def on_startup(dp):
+    init_files()
+    load_data()
+    
+    logger.info(f"MyUved Bot v{BOT_VERSION} started")
+    logger.info(f"Admin ID: {ADMIN_ID}")
+    
+    token = load_token()
+    if token:
+        logger.info("Yandex token loaded")
+        api = YandexCalendarAPI(token)
+        calendars = await api.get_calendars()
+        if calendars:
+            logger.info(f"Found {len(calendars)} calendar(s)")
+        else:
+            logger.warning("No calendars found")
+    else:
+        logger.warning("No Yandex token")
+    
+    asyncio.create_task(check_notifications_task())
+
+
+if __name__ == '__main__':
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
