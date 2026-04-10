@@ -2,10 +2,9 @@
 import logging
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-import requests
-from requests_oauthlib import OAuth2Session
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -27,151 +26,150 @@ logger = logging.getLogger(__name__)
 # Хранилище токенов (в реальном приложении используйте БД)
 user_tokens = {}
 
-# OAuth2 для Яндекс
-AUTHORIZATION_BASE_URL = 'https://oauth.yandex.ru/authorize'
-TOKEN_URL = 'https://oauth.yandex.ru/token'
-CALENDAR_API_URL = 'https://api.calendar.yandex.net/v1'
+class YandexCalendarAPI:
+    def __init__(self, access_token):
+        self.access_token = access_token
+        self.base_url = "https://api.calendar.yandex.net/v1"
 
-def get_yandex_oauth(user_id):
-    """Создаёт OAuth2‑сессию для пользователя."""
-    token = user_tokens.get(user_id)
-    if token:
-        return OAuth2Session(CLIENT_ID, token=token)
-    else:
-        return OAuth2Session(
-            CLIENT_ID,
-            redirect_uri=REDIRECT_URI,
-            scope=['calendar:write', 'calendar:read']
-        )
+    def _make_request(self, method, endpoint, **kwargs):
+        headers = {
+            'Authorization': f'OAuth {self.access_token}',
+            'Content-Type': 'application/json'
+        }
+        url = f"{self.base_url}{endpoint}"
+        response = requests.request(method, url, headers=headers, **kwargs)
+        return response.json() if response.status_code == 200 else None
+
+    def get_events(self, start_date=None, end_date=None):
+        params = {}
+        if start_date:
+            params['start'] = start_date
+        if end_date:
+            params['end'] = end_date
+        return self._make_request('GET', '/events', params=params)
+
+    def create_event(self, summary, start_time, end_time, description=None):
+        data = {
+            'summary': summary,
+            'start': {'dateTime': start_time},
+            'end': {'dateTime': end_time}
+        }
+        if description:
+            data['description'] = description
+        return self._make_request('POST', '/events', json=data)
+
+    def update_event(self, event_id, summary=None, start_time=None, end_time=None, description=None):
+        data = {}
+        if summary:
+            data['summary'] = summary
+        if start_time:
+            data['start'] = {'dateTime': start_time}
+        if end_time:
+            data['end'] = {'dateTime': end_time}
+        if description:
+            data['description'] = description
+        return self._make_request('PATCH', f'/events/{event_id}', json=data)
+
+    def delete_event(self, event_id):
+        return self._make_request('DELETE', f'/events/{event_id}')
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start."""
-    user = update.effective_user
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("У вас нет доступа к этому боту.")
+        return
+
     keyboard = [
-        [InlineKeyboardButton("📅 Добавить событие", callback_data="add_event")],
-        [InlineKeyboardButton("👀 Просмотреть события", callback_data="view_events")],
-        [InlineKeyboardButton("✏️ Редактировать событие", callback_data="edit_event")],
-        [InlineKeyboardButton("🗑️ Удалить событие", callback_data="delete_event")],
-        [InlineKeyboardButton("🔗 Привязать Яндекс Календарь", callback_data="auth_yandex")]
+        [InlineKeyboardButton("Добавить заметку", callback_data="add_event")],
+        [InlineKeyboardButton("Просмотреть заметки", callback_data="view_events")],
+        [InlineKeyboardButton("Редактировать заметку", callback_data="edit_event")],
+        [InlineKeyboardButton("Удалить заметку", callback_data="delete_event")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        f"Привет, {user.first_name}! Я бот для работы с Яндекс Календарём.\n"
-        "Выберите действие:",
+        "Добро пожаловать! Выберите действие:",
         reply_markup=reply_markup
     )
 
-async def auth_yandex(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начинает процесс аутентификации с Яндекс."""
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
-    yandex = get_yandex_oauth(query.from_user.id)
-    authorization_url, state = yandex.authorization_url(AUTHORIZATION_BASE_URL)
-    
-    keyboard = [[InlineKeyboardButton("Авторизоваться", url=authorization_url)]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        "Для работы с Яндекс Календарём нужно авторизоваться:",
-        reply_markup=reply_markup
-    )
 
-async def handle_oauth_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает callback от Яндекс OAuth."""
-    # В реальном приложении здесь должен быть веб‑сервер для приёма callback
-    # Этот пример упрощён — в реальности нужно настроить вебхук
-    await update.message.reply_text("Авторизация завершена! Теперь вы можете работать с календарём.")
-
-async def add_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Добавляет событие в Яндекс Календарь."""
-    query = update.callback_query
-    await query.answer()
-    
     user_id = query.from_user.id
-    yandex = get_yandex_oauth(user_id)
-    
-    if not user_tokens.get(user_id):
-        await query.edit_message_text("Сначала привяжите Яндекс Календарь /start")
+    if user_id != ADMIN_ID:
+        await query.edit_message_text("У вас нет доступа.")
         return
-    
-    # Запрос данных у пользователя
-    context.user_data['awaiting_event_data'] = True
-    await query.edit_message_text(
-        "Введите данные события в формате:\n"
-        "Название, Дата (ГГГГ-ММ-ДД), Время (ЧЧ:ММ), Описание"
-    )
 
-async def handle_event_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает ввод данных события."""
-    if context.user_data.get('awaiting_event_data'):
+    data = query.data
+    if data == "add_event":
+        context.user_data['state'] = 'awaiting_summary'
+        await query.edit_message_text(
+            "Введите заголовок заметки:"
+        )
+    elif data == "view_events":
+        await show_events(query, context)
+    elif data == "edit_event":
+        context.user_data['state'] = 'awaiting_edit_id'
+        await query.edit_message_text(
+            "Введите ID заметки для редактирования:"
+        )
+    elif data == "delete_event":
+        context.user_data['state'] = 'awaiting_delete_id'
+        await query.edit_message_text(
+            "Введите ID заметки для удаления:"
+        )
+
+async def show_events(query, context):
+    # Здесь должен быть код для получения событий из календаря
+    # Для примера показываем заглушку
+    events = [
+        {"id": "1", "summary": "Встреча с командой", "start": "2024-01-15T10:00:00"},
+        {"id": "2", "summary": "Планерка", "start": "2024-01-16T14:00:00"}
+    ]
+
+    if not events:
+        await query.edit_message_text("Заметок не найдено.")
+        return
+
+    message = "Ваши заметки:\n\n"
+    for event in events:
+        message += f"ID: {event['id']}\n"
+        message += f"Заголовок: {event['summary']}\n"
+        message += f"Дата: {event['start']}\n\n"
+
+    await query.edit_message_text(message)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        return
+
+    state = context.user_data.get('state')
+    text = update.message.text
+
+    if state == 'awaiting_summary':
+        context.user_data['event_summary'] = text
+        context.user_data['state'] = 'awaiting_start_time'
+        await update.message.reply_text(
+            "Введите дату и время начала (формат: ГГГГ-ММ-ДД ЧЧ:ММ):"
+        )
+    elif state == 'awaiting_start_time':
         try:
-            # Парсинг ввода
-            parts = update.message.text.split(',')
-            if len(parts) < 3:
-                await update.message.reply_text("Неверный формат. Попробуйте снова.")
-                return
-            
-            title = parts[0].strip()
-            date_str = parts[1].strip()
-            time_str = parts[2].strip()
-            description = parts[3].strip() if len(parts) > 3 else ""
-            
-            # Формирование даты и времени
-            event_datetime = f"{date_str}T{time_str}:00+03:00"  # UTC+3
-            
-            # Создание события через API Яндекс Календаря
-            yandex = get_yandex_oauth(update.effective_user.id)
-            event_data = {
-                "summary": title,
-                "description": description,
-                "start": {"dateTime": event_datetime},
-                "end": {"dateTime": (datetime.fromisoformat(event_datetime.replace('+03:00', '')) + timedelta(hours=1)).isoformat() + '+03:00'}
-            }
-            
-            response = yandex.post(
-                f"{CALENDAR_API_URL}/calendars/primary/events",
-                json=event_data,
-                headers={'Content-Type': 'application/json'}
+            start_time = datetime.strptime(text, "%Y-%m-%d %H:%M")
+            context.user_data['event_start'] = start_time.isoformat()
+            context.user_data['state'] = 'awaiting_end_time'
+            await update.message.reply_text(
+                "Введите дату и время окончания (формат: ГГГГ-ММ-ДД ЧЧ:ММ):"
             )
-            
-            if response.status_code == 201:
-                await update.message.reply_text("Событие успешно добавлено!")
-            else:
-                await update.message.reply_text(f"Ошибка при добавлении: {response.status_code}")
-                
-        except Exception as e:
-            await update.message.reply_text(f"Ошибка: {str(e)}")
-        
-        context.user_data['awaiting_event_data'] = False
+        except ValueError:
+            await update.message.reply_text(
+                "Неверный формат даты. Попробуйте снова:"
+            )
+    elif state == 'awaiting_end_time':
+        try:
+            end_time = datetime.strptime(text, "%Y-%m-%d %H:%M")
+            summary = context.user_data['event_summary']
+            start_time = context.user_data['event_start']
 
-async def view_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает события из Яндекс Календаря."""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    yandex = get_yandex_oauth(user_id)
-    
-    if not user_tokens.get(user_id):
-        await query.edit_message_text("Сначала привяжите Яндекс Календарь /start")
-        return
-    
-    # Получение событий на ближайшие 7 дней
-    now = datetime.utcnow().isoformat() + 'Z'
-    week_later = (datetime.utcnow() + timedelta(days=7)).isoformat() + 'Z'
-    
-    response = yandex.get(
-        f"{CALENDAR_API_URL}/calendars/primary/events",
-        params={
-            'timeMin': now,
-            'timeMax': week_later,
-            'singleEvents': 'true',
-            'orderBy': 'startTime'
-        }
-    )
-    
-    if response.status_code == 200:
-        events = response.json().get('items', [])
-        if not events:
-            message = "На ближайшие 7 дней событий
+            # Здесь должен быть код для создания события в календаре
+            # Для
